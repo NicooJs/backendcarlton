@@ -5,7 +5,6 @@
 
 import express from 'express';
 import cors from 'cors';
-// Importa as classes necessárias da v3
 import { MercadoPagoConfig, Preference } from 'mercadopago';
 import dotenv from 'dotenv';
 import fetch from 'node-fetch';
@@ -15,7 +14,7 @@ dotenv.config();
 
 // Configuração inicial do Express
 const app = express();
-const port = 4000;
+const port = process.env.PORT || 4000; // ✅ Importante para Railway
 app.use(cors());
 app.use(express.json());
 
@@ -29,8 +28,7 @@ if (!accessToken) {
 
 // ------------------- ROTAS DA APLICAÇÃO -------------------
 
-// Em server.js - VERSÃO DE TESTE SEM REDIRECIONAMENTO AUTOMÁTICO
-
+// ROTA /criar-preferencia
 app.post('/criar-preferencia', async (req, res) => {
     console.log("EXECUTANDO TESTE SEM AUTO_RETURN...");
 
@@ -51,9 +49,6 @@ app.post('/criar-preferencia', async (req, res) => {
                 cost: Number(shipmentCost),
                 mode: "not_specified",
             },
-            // As linhas abaixo foram intencionalmente removidas para o teste
-            // back_urls: { ... },
-            // auto_return: 'approved',
         };
 
         const client = new MercadoPagoConfig({ accessToken: process.env.MP_ACCESS_TOKEN });
@@ -75,10 +70,8 @@ app.post('/criar-preferencia', async (req, res) => {
     }
 });
 
-
-// ROTA DE FRETE COM AUTOCOMPLETE DE ENDEREÇO (sem alterações)
+// ROTA /calcular-frete
 app.post('/calcular-frete', async (req, res) => {
-    // ... (código da rota de frete continua o mesmo)
     const { cepDestino } = req.body;
     const cleanCep = cepDestino.replace(/\D/g, '');
 
@@ -92,7 +85,10 @@ app.post('/calcular-frete', async (req, res) => {
         }
 
         const estado = viaCepData.uf;
-        const precosPorEstado = { 'SP': 18.50, 'RJ': 25.70, 'MG': 26.00, 'ES': 28.00, 'PR': 24.50, 'SC': 26.80, 'RS': 28.90 };
+        const precosPorEstado = {
+            'SP': 18.50, 'RJ': 25.70, 'MG': 26.00, 'ES': 28.00,
+            'PR': 24.50, 'SC': 26.80, 'RS': 28.90
+        };
         const precoPadrao = 35.00;
         const precoBase = precosPorEstado[estado] || precoPadrao;
         
@@ -116,9 +112,8 @@ app.post('/calcular-frete', async (req, res) => {
     }
 });
 
-
 // --- INICIALIZAÇÃO DO SERVIDOR ---
 app.listen(port, () => {
-    console.log(`Servidor backend rodando em http://localhost:${port}`);
+    console.log(`Servidor backend rodando na porta ${port}`);
     console.log('Usando Mercado Pago SDK v3.x');
 });
