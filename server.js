@@ -86,7 +86,7 @@ app.post('/calcular-frete', async (req, res) => {
 
         const estado = viaCepData.uf;
         const precosPorEstado = {
-            'SP': 00.50, 'RJ': 25.70, 'MG': 26.00, 'ES': 28.00,
+            'SP': 0.50, 'RJ': 25.70, 'MG': 26.00, 'ES': 28.00,
             'PR': 24.50, 'SC': 26.80, 'RS': 28.90
         };
         const precoPadrao = 35.00;
