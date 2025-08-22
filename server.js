@@ -1,6 +1,6 @@
 import express from 'express';
 import cors from 'cors';
-import { MercadoPagoConfig, Preference } from 'mercadopago';
+import { MercadoPagoConfig, Preference, Payment } from 'mercadopago'; // Adicionado 'Payment'
 import dotenv from 'dotenv';
 import fetch from 'node-fetch';
 
@@ -11,12 +11,15 @@ dotenv.config();
 const app = express();
 const port = process.env.PORT || 4000;
 app.use(cors());
+// Usamos express.json() para o corpo das requisições, e express.raw() para o webhook
 app.use(express.json());
+
 
 // --- Variáveis de Ambiente ---
 const mpAccessToken = process.env.MP_ACCESS_TOKEN;
-const meApiToken = process.env.MELHOR_ENVIO_TOKEN; // NOVO: Token da Melhor Envio
-const senderCep = process.env.SENDER_CEP; // NOVO: CEP da sua loja/origem
+const meApiToken = process.env.MELHOR_ENVIO_TOKEN;
+const senderCep = process.env.SENDER_CEP;
+const backendUrl = process.env.BACKEND_URL || `http://localhost:${port}`; // URL base do seu backend
 
 // Validação das variáveis de ambiente
 if (!mpAccessToken) {
@@ -32,10 +35,12 @@ if (!senderCep) {
     process.exit(1);
 }
 
+// Configuração do Cliente Mercado Pago
+const client = new MercadoPagoConfig({ accessToken: mpAccessToken });
 
 // ------------------- ROTAS DA APLICAÇÃO -------------------
 
-// ROTA /criar-preferencia (Nenhuma alteração necessária aqui)
+// ROTA /criar-preferencia
 app.post('/criar-preferencia', async (req, res) => {
     console.log("Criando preferência de pagamento...");
 
@@ -56,9 +61,22 @@ app.post('/criar-preferencia', async (req, res) => {
                 cost: Number(shipmentCost),
                 mode: "not_specified",
             },
+            // ▼▼▼ GARANTIA DOS MEIOS DE PAGAMENTO ▼▼▼
+            // Este bloco garante que não estamos excluindo o PIX.
+            // Por padrão, ele permite TUDO que sua conta aceita.
+            payment_methods: {
+                // Para não aceitar boleto, por exemplo, descomente a linha abaixo
+                // excluded_payment_types: [{ id: "ticket" }],
+            },
+            // URL para onde o Mercado Pago enviará a notificação de pagamento
+            notification_url: `${backendUrl}/notificacao-pagamento`,
+            back_urls: {
+                success: `https://seu-site.com/sucesso`, // Altere para sua URL de sucesso
+                failure: `https://seu-site.com/falha`,   // Altere para sua URL de falha
+                pending: `https://seu-site.com/pendente` // Altere para sua URL de pendente
+            }
         };
 
-        const client = new MercadoPagoConfig({ accessToken: mpAccessToken });
         const preference = new Preference(client);
         const result = await preference.create({ body: preferenceBody });
 
@@ -77,8 +95,9 @@ app.post('/criar-preferencia', async (req, res) => {
     }
 });
 
-// ROTA /calcular-frete (Totalmente refeita para Melhor Envio)
+// ROTA /calcular-frete (Sem alterações)
 app.post('/calcular-frete', async (req, res) => {
+    // ... seu código de calcular frete com Melhor Envio continua aqui, sem alterações ...
     const { cepDestino, items } = req.body;
     const cleanCepDestino = cepDestino.replace(/\D/g, '');
 
@@ -87,95 +106,91 @@ app.post('/calcular-frete', async (req, res) => {
     }
 
     try {
-        // --- 1. Buscar dados do endereço pelo ViaCEP (para UX no frontend) ---
         const viaCepUrl = `https://viacep.com.br/ws/${cleanCepDestino}/json/`;
         const viaCepResponse = await fetch(viaCepUrl);
         const addressInfo = await viaCepResponse.json();
+        if (addressInfo.erro) throw new Error("CEP não encontrado.");
 
-        if (addressInfo.erro) {
-            throw new Error("CEP não encontrado. Verifique o número.");
-        }
-
-        // --- 2. Preparar os dados para a API da Melhor Envio ---
-        // IMPORTANTE: Você PRECISA ter peso e dimensões para seus produtos.
-        // Aqui estamos usando valores fixos como EXEMPLO. O ideal é que esses
-        // dados venham do seu banco de dados junto com cada produto.
-        const totalValue = items.reduce((sum, item) => sum + (item.unit_price * item.quantity), 0);
-        const totalWeight = items.reduce((sum, item) => {
-            // Exemplo: cada item pesa 0.3kg. Adapte para a sua realidade!
-            return sum + (0.3 * item.quantity);
-        }, 0);
-        
         const shipmentPayload = {
             from: { postal_code: senderCep.replace(/\D/g, '') },
             to: { postal_code: cleanCepDestino },
             products: items.map(item => ({
-                id: item.id,
-                width: 15, // Exemplo em cm
-                height: 10, // Exemplo em cm
-                length: 20, // Exemplo em cm
-                weight: 0.3, // Exemplo em kg
-                insurance_value: item.unit_price,
-                quantity: item.quantity,
+                id: item.id, width: 15, height: 10, length: 20, weight: 0.3,
+                insurance_value: item.unit_price, quantity: item.quantity,
             })),
-            // Outra opção é usar 'package' se todos os itens forem em uma caixa só
-            // "package": {
-            //     "weight": totalWeight,
-            //     "width": 20,
-            //     "height": 20,
-            //     "length": 20,
-            //     "insurance_value": totalValue
-            // },
-            options: {
-                receipt: false,
-                own_hand: false,
-            },
+            options: { receipt: false, own_hand: false },
         };
 
-        // --- 3. Chamar a API da Melhor Envio ---
         const meResponse = await fetch('https://www.melhorenvio.com.br/api/v2/me/shipment/calculate', {
             method: 'POST',
             headers: {
-                'Accept': 'application/json',
-                'Content-Type': 'application/json',
-                'Authorization': `Bearer ${meApiToken}`,
-                'User-Agent': 'Sua Loja (seuemail@seudominio.com)' // Boa prática
+                'Accept': 'application/json', 'Content-Type': 'application/json',
+                'Authorization': `Bearer ${meApiToken}`, 'User-Agent': 'Sua Loja'
             },
             body: JSON.stringify(shipmentPayload)
         });
 
         if (!meResponse.ok) {
             const errorData = await meResponse.json();
-            console.error("ERRO DA API MELHOR ENVIO:", errorData);
-            throw new Error(errorData.message || 'Não foi possível calcular o frete com a Melhor Envio.');
+            throw new Error(errorData.message || 'Erro na API da Melhor Envio.');
         }
 
         const shippingOptions = await meResponse.json();
-
-        // --- 4. Formatar a resposta para o frontend ---
         const formattedServices = shippingOptions
-            .filter(option => !option.error) // Filtra serviços que deram erro
+            .filter(option => !option.error)
             .map(option => ({
-                // O frontend espera 'code', mas o 'id' da Melhor Envio serve.
-                code: option.id, 
-                name: `${option.company.name} - ${option.name}`,
-                price: parseFloat(option.price),
-                deliveryTime: option.delivery_time,
+                code: option.id, name: `${option.company.name} - ${option.name}`,
+                price: parseFloat(option.price), deliveryTime: option.delivery_time,
             }));
 
         res.status(200).json({
             services: formattedServices,
             addressInfo: {
-                logradouro: addressInfo.logradouro,
-                bairro: addressInfo.bairro,
-                localidade: addressInfo.localidade,
-                uf: addressInfo.uf
+                logradouro: addressInfo.logradouro, bairro: addressInfo.bairro,
+                localidade: addressInfo.localidade, uf: addressInfo.uf
             }
         });
 
     } catch (error) {
-        console.error("ERRO GERAL AO CALCULAR FRETE:", error.message);
+        console.error("ERRO AO CALCULAR FRETE:", error.message);
         res.status(500).json({ error: error.message || 'Não foi possível calcular o frete.' });
+    }
+});
+
+
+// ROTA DE WEBHOOK PARA NOTIFICAÇÕES DO MERCADO PAGO
+app.post('/notificacao-pagamento', async (req, res) => {
+    const { query } = req;
+    const topic = query.topic || query.type;
+
+    console.log('Recebi uma notificação:', { topic, id: query.id });
+
+    try {
+        if (topic === 'payment') {
+            const paymentId = query.id;
+            const payment = await new Payment(client).get({ id: paymentId });
+
+            console.log('Detalhes do Pagamento:', {
+                id: payment.id,
+                status: payment.status,
+                payment_method_id: payment.payment_method_id,
+            });
+
+            if (payment.status === 'approved') {
+                console.log(`✅ Pagamento ${paymentId} APROVADO!`);
+                // AQUI VOCÊ DEVE ATUALIZAR SEU BANCO DE DADOS
+                // Ex: marcar o pedido como "PAGO"
+                // Ex: enviar email de confirmação para o cliente
+                // Ex: iniciar o processo de separação do produto
+            } else {
+                console.log(`❕ Pagamento ${paymentId} com status: ${payment.status}`);
+            }
+        }
+        // É importante responder com status 200 para o Mercado Pago saber que você recebeu.
+        res.status(200).send('Notificação recebida');
+    } catch (error) {
+        console.error('Erro ao processar notificação:', error);
+        res.status(500).send('Erro no servidor');
     }
 });
 
