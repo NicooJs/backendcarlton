@@ -245,4 +245,4 @@ async function enviarEmailDeConfirmacao(pedido) {
 // ------------------- INICIALIZAÇÃO -------------------
 app.listen(port, () => {
   console.log(`Servidor rodando na porta ${port}`);
-});
+});... (NaN KB restante(s))
