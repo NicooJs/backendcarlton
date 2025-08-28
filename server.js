@@ -148,21 +148,53 @@ app.post('/notificacao-pagamento', async (req, res) => {
           pedidoId,
         ]);
 
-        // Criar pedido no Melhor Envio
-        const itens = JSON.parse(pedido.itens_pedido);
-        const frete = JSON.parse(pedido.info_frete);
+        // =========================================================================
+        // ======================= INÍCIO DA ÁREA MODIFICADA =======================
+        // =========================================================================
+
+        // Criar pedido no Melhor Envio com todos os dados
+        const itensDoPedido = JSON.parse(pedido.itens_pedido);
+        const infoDoFrete = JSON.parse(pedido.info_frete);
 
         const mePayload = {
-          from: { postal_code: SENDER_CEP.replace(/\D/g, '') },
-          to: { postal_code: pedido.cep_cliente.replace(/\D/g, '') },
-          package: { weight: 0.3, width: 20, height: 10, length: 20 },
+          service: infoDoFrete.id, // Usar o ID do serviço de frete
+          from: {
+            name: "Nome da Sua Loja", // <-- IMPORTANTE: Coloque o nome da sua loja
+            postal_code: SENDER_CEP.replace(/\D/g, ''),
+          },
+          to: {
+            name: `${pedido.nome_cliente} ${pedido.sobrenome_cliente}`,
+            phone: pedido.telefone_cliente.replace(/\D/g, ''),
+            email: pedido.email_cliente,
+            document: pedido.cpf_cliente.replace(/\D/g, ''),
+            address: pedido.endereco_cliente,
+            number: pedido.numero_cliente,
+            complement: pedido.complemento_cliente,
+            district: pedido.bairro_cliente,
+            city: pedido.cidade_cliente,
+            state_abbr: pedido.estado_cliente,
+            postal_code: pedido.cep_cliente.replace(/\D/g, ''),
+            note: `Pedido #${pedido.id}`,
+          },
+          products: itensDoPedido.map(item => ({
+            name: item.title,
+            quantity: item.quantity,
+            unitary_value: item.unit_price,
+          })),
+          volumes: [{
+            weight: 0.3, // ATENÇÃO: Considere tornar isso dinâmico
+            width: 20,
+            height: 10,
+            length: 20,
+          }],
           options: {
-            insurance_value: pedido.valor_total,
+            insurance_value: Number(pedido.valor_total),
             receipt: false,
             own_hand: false,
+            non_commercial: true, // <-- MUITO IMPORTANTE: para gerar declaração de conteúdo
+            platform: "Sua Loja",
+            tags: [{ tag: `Pedido #${pedido.id}` }],
           },
-          service: frete.code,
-          agency: null,
         };
 
         const meResponse = await fetch('https://www.melhorenvio.com.br/api/v2/me/cart', {
@@ -171,29 +203,34 @@ app.post('/notificacao-pagamento', async (req, res) => {
             Authorization: `Bearer ${MELHOR_ENVIO_TOKEN}`,
             'Content-Type': 'application/json',
             Accept: 'application/json',
-            'User-Agent': 'Sua Loja (contato@seudominio.com)',
+            'User-Agent': 'Sua Loja (carltoncoletivo@audionoiseskatevisual.com)', // <-- IMPORTANTE: Use seu email
           },
           body: JSON.stringify(mePayload),
         });
 
         const meResult = await meResponse.json();
 
-        if (meResponse.ok) {
-          console.log(`🚚 Pedido ${pedidoId} criado no Melhor Envio!`);
-          await db.query('UPDATE pedidos SET melhor_envio_id = ? WHERE id = ?', [meResult.id, pedidoId]);
+        // =======================================================================
+        // ======================== FIM DA ÁREA MODIFICADA =======================
+        // =======================================================================
+
+        if (meResponse.ok && meResult.id) {
+            console.log(`🚚 Pedido ${pedidoId} adicionado ao carrinho do Melhor Envio! ID: ${meResult.id}`);
+            await db.query('UPDATE pedidos SET melhor_envio_id = ? WHERE id = ?', [meResult.id, pedidoId]);
         } else {
-          console.error('❌ Erro Melhor Envio:', meResult);
+            // Log detalhado do erro para facilitar a depuração
+            console.error(`❌ Erro ao adicionar pedido #${pedidoId} no Melhor Envio:`, JSON.stringify(meResult, null, 2));
         }
 
         // Email de confirmação
         await enviarEmailDeConfirmacao({ ...pedido, mercado_pago_id: payment.id });
 
-        console.log(`✅ Pedido ${pedidoId} aprovado, processado e enviado p/ Melhor Envio!`);
+        console.log(`✅ Pedido ${pedidoId} aprovado e processado!`);
       }
     }
     res.status(200).send('OK');
   } catch (error) {
-    console.error('ERRO NOTIFICAÇÃO:', error);
+    console.error('ERRO NA ROTA DE NOTIFICAÇÃO:', error);
     res.status(500).send('Erro ao processar notificação.');
   }
 });
@@ -245,4 +282,4 @@ async function enviarEmailDeConfirmacao(pedido) {
 // ------------------- INICIALIZAÇÃO -------------------
 app.listen(port, () => {
   console.log(`Servidor rodando na porta ${port}`);
-});... (NaN KB restante(s))
+});
