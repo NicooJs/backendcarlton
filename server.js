@@ -46,108 +46,6 @@ const transporter = nodemailer.createTransport({
 
 // ROTA /criar-preferencia
 app.post('/criar-preferencia', async (req, res) => {
-    // ... (código sem alterações)
-});
-
-// ROTA /calcular-frete
-app.post('/calcular-frete', async (req, res) => {
-    // ... (código sem alterações)
-});
-
-// ROTA DE WEBHOOK PARA NOTIFICAÇÕES DO MERCADO PAGO
-app.post('/notificacao-pagamento', async (req, res) => {
-    // ... (código sem alterações)
-});
-
-
-// --- FUNÇÃO AUXILIAR DE ENVIO DE E-MAIL ---
-async function enviarEmailDeConfirmacao(pedido) {
-    // ... (código sem alterações)
-}
-
-
-// --- FUNÇÃO: INSERIR PEDIDO NO CARRINHO DO MELHOR ENVIO ---
-async function inserirPedidoNoCarrinhoME(pedido) {
-    console.log(`Iniciando inserção no carrinho Melhor Envio para o pedido #${pedido.id}`);
-    
-    const itens = typeof pedido.itens_pedido === 'string' ? JSON.parse(pedido.itens_pedido) : pedido.itens_pedido;
-    const frete = typeof pedido.info_frete === 'string' ? JSON.parse(pedido.info_frete) : pedido.info_frete;
-    const subtotal = itens.reduce((sum, item) => sum + item.unit_price * item.quantity, 0);
-    const pesoTotal = itens.reduce((sum, item) => sum + (0.3 * item.quantity), 0);
-
-    const payload = {
-        service: frete.code,
-        from: {
-            name: SENDER_NAME, phone: SENDER_PHONE.replace(/\D/g, ''), email: SENDER_EMAIL,
-            document: SENDER_DOCUMENT.replace(/\D/g, ''), address: SENDER_STREET,
-            complement: SENDER_COMPLEMENT, number: SENDER_NUMBER, district: SENDER_DISTRICT,
-            city: SENDER_CITY, state_abbr: SENDER_STATE_ABBR, country_id: "BR",
-            postal_code: SENDER_CEP.replace(/\D/g, ''),
-        },
-        to: {
-            name: pedido.nome_cliente, phone: pedido.telefone_cliente.replace(/\D/g, ''),
-            email: pedido.email_cliente, document: pedido.cpf_cliente.replace(/\D/g, ''),
-            address: pedido.logradouro, complement: pedido.complemento, number: pedido.numero,
-            district: pedido.bairro, city: pedido.cidade, state_abbr: pedido.estado,
-            country_id: "BR", postal_code: pedido.cep.replace(/\D/g, ''),
-        },
-        products: itens.map(item => ({
-            name: item.title,
-            quantity: item.quantity,
-            unitary_value: item.unit_price,
-        })),
-        volumes: [{
-            height: 10,
-            width: 15,
-            length: 20,
-            weight: pesoTotal < 0.01 ? 0.01 : pesoTotal
-        }],
-        options: {
-            // ===================================================================
-            // ALTERAÇÃO FINAL AQUI: Garante que o valor do seguro seja no mínimo R$ 1,00
-            // ===================================================================
-            insurance_value: Math.max(1, subtotal),
-            receipt: false,
-            own_hand: false,
-            reverse: false,
-            non_commercial: true,
-            tags: [{ tag: `Pedido #${pedido.id}`, url: null }],
-        },
-    };
-    
-    const response = await fetch('https://www.melhorenvio.com.br/api/v2/me/cart', {
-        method: 'POST',
-        headers: {
-            'Accept': 'application/json', 'Content-Type': 'application/json',
-            'Authorization': `Bearer ${MELHOR_ENVIO_TOKEN}`,
-            'User-Agent': 'Sua Loja (contato@seusite.com)'
-        },
-        body: JSON.stringify(payload)
-    });
-
-    const data = await response.json();
-    if (!response.ok) {
-        console.error("Payload enviado para o Melhor Envio:", JSON.stringify(payload, null, 2));
-        console.error("Resposta de erro do Melhor Envio:", data);
-        throw new Error(JSON.stringify(data.error || 'Erro ao adicionar etiqueta ao carrinho do Melhor Envio.'));
-    }
-
-    const melhorEnvioId = data.id;
-    console.log(`SUCESSO! Pedido #${pedido.id} inserido no carrinho Melhor Envio com ID: ${melhorEnvioId}`);
-
-    await db.query("UPDATE pedidos SET melhor_envio_id = ? WHERE id = ?", [melhorEnvioId, pedido.id]);
-    console.log(`ID do Melhor Envio salvo no banco para o pedido #${pedido.id}.`);
-}
-
-// --- INICIALIZAÇÃO DO SERVIDOR ---
-app.listen(port, () => {
-    // ... (código sem alterações)
-});
-
-
-// Código completo das outras funções para você ter o arquivo inteiro
-
-app.post('/criar-preferencia', async (req, res) => {
     console.log("LOG: Corpo da requisição recebido em /criar-preferencia:", JSON.stringify(req.body, null, 2));
     try {
         const { items, customerInfo, selectedShipping, shipmentCost } = req.body;
@@ -198,6 +96,7 @@ app.post('/criar-preferencia', async (req, res) => {
     }
 });
 
+// ROTA /calcular-frete
 app.post('/calcular-frete', async (req, res) => {
     console.log("LOG: Corpo da requisição recebido em /calcular-frete:", req.body);
     const { cepDestino, items } = req.body;
@@ -234,6 +133,7 @@ app.post('/calcular-frete', async (req, res) => {
     }
 });
 
+// ROTA DE WEBHOOK PARA NOTIFICAÇÕES DO MERCADO PAGO
 app.post('/notificacao-pagamento', async (req, res) => {
     console.log('LOG: Notificação recebida:', req.query);
     const topic = req.query.topic || req.query.type;
@@ -282,6 +182,8 @@ app.post('/notificacao-pagamento', async (req, res) => {
     res.status(200).send('Notificação recebida');
 });
 
+
+// --- FUNÇÃO AUXILIAR DE ENVIO DE E-MAIL ---
 async function enviarEmailDeConfirmacao(pedido) {
     const itens = typeof pedido.itens_pedido === 'string' ? JSON.parse(pedido.itens_pedido) : pedido.itens_pedido;
     const frete = typeof pedido.info_frete === 'string' ? JSON.parse(pedido.info_frete) : pedido.info_frete;
@@ -324,6 +226,78 @@ async function enviarEmailDeConfirmacao(pedido) {
     }
 }
 
+
+// --- FUNÇÃO: INSERIR PEDIDO NO CARRINHO DO MELHOR ENVIO ---
+async function inserirPedidoNoCarrinhoME(pedido) {
+    console.log(`Iniciando inserção no carrinho Melhor Envio para o pedido #${pedido.id}`);
+    
+    const itens = typeof pedido.itens_pedido === 'string' ? JSON.parse(pedido.itens_pedido) : pedido.itens_pedido;
+    const frete = typeof pedido.info_frete === 'string' ? JSON.parse(pedido.info_frete) : pedido.info_frete;
+    const subtotal = itens.reduce((sum, item) => sum + item.unit_price * item.quantity, 0);
+    const pesoTotal = itens.reduce((sum, item) => sum + (0.3 * item.quantity), 0);
+
+    const payload = {
+        service: frete.code,
+        from: {
+            name: SENDER_NAME, phone: SENDER_PHONE.replace(/\D/g, ''), email: SENDER_EMAIL,
+            document: SENDER_DOCUMENT.replace(/\D/g, ''), address: SENDER_STREET,
+            complement: SENDER_COMPLEMENT, number: SENDER_NUMBER, district: SENDER_DISTRICT,
+            city: SENDER_CITY, state_abbr: SENDER_STATE_ABBR, country_id: "BR",
+            postal_code: SENDER_CEP.replace(/\D/g, ''),
+        },
+        to: {
+            name: pedido.nome_cliente, phone: pedido.telefone_cliente.replace(/\D/g, ''),
+            email: pedido.email_cliente, document: pedido.cpf_cliente.replace(/\D/g, ''),
+            address: pedido.logradouro, complement: pedido.complemento, number: pedido.numero,
+            district: pedido.bairro, city: pedido.cidade, state_abbr: pedido.estado,
+            country_id: "BR", postal_code: pedido.cep.replace(/\D/g, ''),
+        },
+        products: itens.map(item => ({
+            name: item.title,
+            quantity: item.quantity,
+            unitary_value: item.unit_price,
+        })),
+        volumes: [{
+            height: 10,
+            width: 15,
+            length: 20,
+            weight: pesoTotal < 0.01 ? 0.01 : pesoTotal
+        }],
+        options: {
+            insurance_value: Math.max(1, subtotal),
+            receipt: false,
+            own_hand: false,
+            reverse: false,
+            non_commercial: true,
+            tags: [{ tag: `Pedido #${pedido.id}`, url: null }],
+        },
+    };
+    
+    const response = await fetch('https://www.melhorenvio.com.br/api/v2/me/cart', {
+        method: 'POST',
+        headers: {
+            'Accept': 'application/json', 'Content-Type': 'application/json',
+            'Authorization': `Bearer ${MELHOR_ENVIO_TOKEN}`,
+            'User-Agent': 'Sua Loja (contato@seusite.com)'
+        },
+        body: JSON.stringify(payload)
+    });
+
+    const data = await response.json();
+    if (!response.ok) {
+        console.error("Payload enviado para o Melhor Envio:", JSON.stringify(payload, null, 2));
+        console.error("Resposta de erro do Melhor Envio:", data);
+        throw new Error(JSON.stringify(data.error || 'Erro ao adicionar etiqueta ao carrinho do Melhor Envio.'));
+    }
+
+    const melhorEnvioId = data.id;
+    console.log(`SUCESSO! Pedido #${pedido.id} inserido no carrinho Melhor Envio com ID: ${melhorEnvioId}`);
+
+    await db.query("UPDATE pedidos SET melhor_envio_id = ? WHERE id = ?", [melhorEnvioId, pedido.id]);
+    console.log(`ID do Melhor Envio salvo no banco para o pedido #${pedido.id}.`);
+}
+
+// --- INICIALIZAÇÃO DO SERVIDOR ---
 app.listen(port, () => {
     console.log(`Servidor backend rodando na porta ${port}`);
 });
