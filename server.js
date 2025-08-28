@@ -61,7 +61,6 @@ app.post('/criar-preferencia', async (req, res) => {
         const fullAddress = `${customerInfo.address}, ${customerInfo.number} ${customerInfo.complement || ''} - ${customerInfo.neighborhood}, ${customerInfo.city}/${customerInfo.state}, CEP: ${customerInfo.cep}`;
 
         // 1. SALVA O PEDIDO NO BANCO DE DADOS
-        // ATENÇÃO: Adapte os nomes das colunas (nome_cliente, email_cliente, etc.) para os nomes da SUA tabela.
         const sql = `
             INSERT INTO pedidos (nome_cliente, email_cliente, cpf_cliente, telefone_cliente, endereco_entrega, itens_pedido, info_frete, valor_total, status)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'AGUARDANDO_PAGAMENTO');
@@ -108,10 +107,8 @@ app.post('/criar-preferencia', async (req, res) => {
 });
 
 
-// ROTA /calcular-frete (Sem alterações)
+// ROTA /calcular-frete
 app.post('/calcular-frete', async (req, res) => {
-    // ... Seu código de cálculo de frete original e funcional continua aqui ...
-    // Nenhuma alteração foi necessária nesta rota.
     console.log("LOG: Corpo da requisição recebido em /calcular-frete:", req.body);
     const { cepDestino, items } = req.body;
     if (!cepDestino || !items || items.length === 0) {
@@ -163,7 +160,6 @@ app.post('/notificacao-pagamento', async (req, res) => {
                 const pedidoId = payment.external_reference;
 
                 // 1. BUSCA O PEDIDO NO BANCO DE DADOS
-                // ATENÇÃO: Adapte o nome da tabela 'pedidos' e das colunas se forem diferentes.
                 const [rows] = await db.query('SELECT * FROM pedidos WHERE id = ?', [pedidoId]);
                 if (rows.length === 0) throw new Error(`Pedido ${pedidoId} não encontrado no banco de dados.`);
                 
@@ -175,13 +171,54 @@ app.post('/notificacao-pagamento', async (req, res) => {
                 }
 
                 // 2. ATUALIZA O STATUS DO PEDIDO PARA 'PAGO'
-                // ATENÇÃO: Adapte os nomes das colunas 'status' e 'mercado_pago_id' se forem diferentes.
                 await db.query("UPDATE pedidos SET status = 'PAGO', mercado_pago_id = ? WHERE id = ?", [payment.id, pedidoId]);
 
-                // 3. ENVIA O E-MAIL DE CONFIRMAÇÃO
+                // 3. CRIAR PEDIDO NO MELHOR ENVIO
+                const itens = JSON.parse(pedidoDoBanco.itens_pedido);
+                const frete = JSON.parse(pedidoDoBanco.info_frete);
+
+                const mePayload = {
+                    from: { postal_code: SENDER_CEP.replace(/\D/g, '') },
+                    to: { postal_code: frete.to.postal_code },
+                    package: {
+                        weight: 0.3,
+                        width: 20,
+                        height: 10,
+                        length: 20
+                    },
+                    options: {
+                        insurance_value: pedidoDoBanco.valor_total,
+                        receipt: false,
+                        own_hand: false
+                    },
+                    service: frete.code,
+                    agency: null
+                };
+
+                const meResponse = await fetch('https://www.melhorenvio.com.br/api/v2/me/cart', {
+                    method: 'POST',
+                    headers: {
+                        'Authorization': `Bearer ${MELHOR_ENVIO_TOKEN}`,
+                        'Content-Type': 'application/json',
+                        'Accept': 'application/json',
+                        'User-Agent': 'Sua Loja (contato@seudominio.com)'
+                    },
+                    body: JSON.stringify(mePayload)
+                });
+
+                const meResult = await meResponse.json();
+
+                if (meResponse.ok) {
+                    console.log(`🚚 Pedido ${pedidoId} criado no Melhor Envio com sucesso!`);
+                    await db.query("UPDATE pedidos SET melhor_envio_id = ? WHERE id = ?", [meResult.id, pedidoId]);
+                } else {
+                    console.error("❌ Erro ao criar pedido no Melhor Envio:", meResult);
+                }
+
+                // 4. ENVIA O E-MAIL DE CONFIRMAÇÃO
                 await enviarEmailDeConfirmacao({ ...pedidoDoBanco, mercado_pago_id: payment.id });
 
-                console.log(`✅ Pedido ${pedidoId} APROVADO e processado com sucesso!`);
+                console.log(`✅ Pedido ${pedidoId} APROVADO, processado e enviado para Melhor Envio!`);
             }
         }
         res.status(200).send('Notificação recebida');
@@ -194,8 +231,6 @@ app.post('/notificacao-pagamento', async (req, res) => {
 
 // --- FUNÇÃO AUXILIAR DE ENVIO DE E-MAIL ---
 async function enviarEmailDeConfirmacao(pedido) {
-    // ATENÇÃO: Adapte os nomes das propriedades (pedido.itens_pedido, pedido.info_frete, etc.)
-    // para corresponderem aos nomes das colunas retornadas do seu banco de dados.
     const itens = JSON.parse(pedido.itens_pedido);
     const frete = JSON.parse(pedido.info_frete);
     
