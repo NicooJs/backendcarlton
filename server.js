@@ -60,9 +60,9 @@ app.post('/criar-preferencia', async (req, res) => {
         const total = items.reduce((sum, item) => sum + item.unit_price * item.quantity, 0) + shipmentCost;
         const fullAddress = `${customerInfo.address}, ${customerInfo.number} ${customerInfo.complement || ''} - ${customerInfo.neighborhood}, ${customerInfo.city}/${customerInfo.state}, CEP: ${customerInfo.cep}`;
 
-        // 1. SALVA O PEDIDO NO BANCO DE DADOS (Query alinhada com a tabela)
+        // CORRIGIDO: Query SQL com os nomes exatos da sua tabela
         const sql = `
-            INSERT INTO pedidos (nome_cliente, email_cliente, cpf_cliente, telefone_cliente, endereco_entrega, itens_pedido, info_frete, valor_total, status)
+            INSERT INTO pedidos (nome_cliente, payer_email, cpf_cliente, telefone_cliente, endereco_entrega, items, info_frete, total_amount, status)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'AGUARDANDO_PAGAMENTO');
         `;
         const [result] = await db.query(sql, [
@@ -77,13 +77,10 @@ app.post('/criar-preferencia', async (req, res) => {
         ]);
         const novoPedidoId = result.insertId;
 
-        // 2. CRIA A PREFERÊNCIA DE PAGAMENTO
+        // CRIA A PREFERÊNCIA DE PAGAMENTO (sem alteração necessária aqui)
         const preferenceBody = {
             items: items,
-            payer: {
-                first_name: customerInfo.firstName,
-                email: customerInfo.email,
-            },
+            payer: { first_name: customerInfo.firstName, email: customerInfo.email },
             shipments: { cost: Number(shipmentCost) },
             external_reference: novoPedidoId.toString(),
             notification_url: `${BACKEND_URL}/notificacao-pagamento`,
@@ -107,9 +104,9 @@ app.post('/criar-preferencia', async (req, res) => {
 });
 
 
-// ROTA /calcular-frete (Sem alterações)
+// ROTA /calcular-frete (sem alterações)
 app.post('/calcular-frete', async (req, res) => {
-    // ...código original sem alterações...
+    // ...
 });
 
 
@@ -137,11 +134,11 @@ app.post('/notificacao-pagamento', async (req, res) => {
                     return res.status(200).send('Notificação já processada.');
                 }
 
-                // ATUALIZA O STATUS DO PEDIDO (Query alinhada com a tabela)
-                await db.query("UPDATE pedidos SET status = 'PAGO', mercado_pago_id = ? WHERE id = ?", [payment.id, pedidoId]);
+                // CORRIGIDO: Query UPDATE com o nome `payment_id` da sua tabela
+                await db.query("UPDATE pedidos SET status = 'PAGO', payment_id = ? WHERE id = ?", [payment.id, pedidoId]);
 
                 // ENVIA O E-MAIL DE CONFIRMAÇÃO
-                await enviarEmailDeConfirmacao({ ...pedidoDoBanco, mercado_pago_id: payment.id });
+                await enviarEmailDeConfirmacao({ ...pedidoDoBanco, payment_id: payment.id });
 
                 console.log(`✅ Pedido ${pedidoId} APROVADO e processado com sucesso!`);
             }
@@ -156,17 +153,17 @@ app.post('/notificacao-pagamento', async (req, res) => {
 
 // --- FUNÇÃO AUXILIAR DE ENVIO DE E-MAIL ---
 async function enviarEmailDeConfirmacao(pedido) {
-    // Esta função assume que o objeto 'pedido' vem do banco com os nomes de coluna corretos
-    const itens = JSON.parse(pedido.itens_pedido);
+    // CORRIGIDO: Usa as propriedades com os nomes exatos da sua tabela
+    const itens = JSON.parse(pedido.items);
     const frete = JSON.parse(pedido.info_frete);
     
     const emailBody = `
       <h1>🎉 Novo Pedido Recebido! (Nº ${pedido.id})</h1>
-      <p><strong>ID do Pagamento (Mercado Pago):</strong> ${pedido.mercado_pago_id}</p>
+      <p><strong>ID do Pagamento (Mercado Pago):</strong> ${pedido.payment_id}</p>
       <hr>
       <h2>Dados do Cliente</h2>
       <p><strong>Nome:</strong> ${pedido.nome_cliente}</p>
-      <p><strong>E-mail:</strong> ${pedido.email_cliente}</p>
+      <p><strong>E-mail:</strong> ${pedido.payer_email}</p>
       <p><strong>CPF:</strong> ${pedido.cpf_cliente}</p>
       <p><strong>Telefone:</strong> ${pedido.telefone_cliente}</p>
       <hr>
@@ -180,14 +177,14 @@ async function enviarEmailDeConfirmacao(pedido) {
       <hr>
       <h2>Valores</h2>
       <p><strong>Frete (${frete.name}):</strong> R$ ${Number(frete.price).toFixed(2)}</p>
-      <h3><strong>Total:</strong> R$ ${Number(pedido.valor_total).toFixed(2)}</h3>
+      <h3><strong>Total:</strong> R$ ${Number(pedido.total_amount).toFixed(2)}</h3>
     `;
 
     try {
         await transporter.sendMail({
             from: `"Sua Loja" <${EMAIL_USER}>`,
             to: EMAIL_TO,
-            bcc: pedido.email_cliente, // Envia cópia oculta para o cliente
+            bcc: pedido.payer_email, // Envia cópia oculta para o cliente
             subject: `Confirmação do Pedido #${pedido.id}`,
             html: emailBody,
         });
