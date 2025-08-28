@@ -199,3 +199,12 @@ app.post('/notificacao-pagamento', async (req, res) => {
 app.listen(port, () => {
     console.log(`Servidor backend rodando na porta ${port}`);
 });
+CREATE TABLE pedidos (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    preference_id VARCHAR(255) NOT NULL,
+    payer_email VARCHAR(255) NOT NULL,
+    total_amount DECIMAL(10, 2) NOT NULL,
+    shipment_cost DECIMAL(10, 2) NOT NULL,
+    status VARCHAR(50) DEFAULT 'pending',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
