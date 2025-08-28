@@ -1,14 +1,6 @@
 /* ================================================================================ 
 |   ARQUIVO DO SERVIDOR BACKEND - ADAPTADO PARA FLUXO PROFISSIONAL COM BANCO     | 
-================================================================================ 
-| Ações a serem tomadas:                                                       |
-| 1. Execute `npm install nodemailer mysql2`                                     |
-| 2. Crie o arquivo `db.js` para a conexão com o banco de dados.                 |
-| 3. Preencha TODAS as variáveis no arquivo `.env`.                              |
-| 4. ATENÇÃO: Adapte os nomes das colunas nas queries SQL abaixo para            |
-|    corresponderem exatamente à sua tabela `pedidos`.                           |
-================================================================================ 
-*/
+================================================================================ */
 
 import express from 'express';
 import cors from 'cors';
@@ -82,16 +74,12 @@ app.post('/criar-preferencia', async (req, res) => {
         const total = items.reduce((sum, item) => sum + item.unit_price * item.quantity, 0) + shipmentCost;
         const fullAddress = `${customerInfo.address}, ${customerInfo.number} ${customerInfo.complement || ''} - ${customerInfo.neighborhood}, ${customerInfo.city}/${customerInfo.state}, CEP: ${customerInfo.cep}`;
         
-        // ===================================================================
-        // ALTERAÇÃO AQUI: A string SQL foi limpa, removendo espaços e quebras de linha no início.
-        // ===================================================================
         const sql = `INSERT INTO pedidos (
                 nome_cliente, email_cliente, cpf_cliente, telefone_cliente, 
                 endereco_entrega, cep, logradouro, numero, complemento, bairro, cidade, estado,
                 itens_pedido, info_frete, valor_total, status
             )
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'AGUARDANDO_PAGAMENTO');`;
-        // ===================================================================
 
         const [result] = await db.query(sql, [
             `${customerInfo.firstName} ${customerInfo.lastName}`,
@@ -182,64 +170,69 @@ app.post('/calcular-frete', async (req, res) => {
 // ROTA DE WEBHOOK PARA NOTIFICAÇÕES DO MERCADO PAGO
 app.post('/notificacao-pagamento', async (req, res) => {
     console.log('LOG: Notificação recebida:', req.query);
-    try {
-        const { query } = req;
-        const topic = query.topic || query.type;
+    const topic = req.query.topic || req.query.type;
 
-        if (topic === 'payment') {
-            const paymentId = query.id;
+    if (topic === 'payment') {
+        try {
+            const paymentId = req.query.id || req.query['data.id'];
             const payment = await new Payment(client).get({ id: paymentId });
 
-            if ((payment.status === 'approved' || payment.status === 'pending') && payment.external_reference) {
+            if (payment && payment.external_reference) {
                 const pedidoId = payment.external_reference;
-
                 const [rows] = await db.query('SELECT * FROM pedidos WHERE id = ?', [pedidoId]);
-                if (rows.length === 0) throw new Error(`Pedido ${pedidoId} não encontrado no banco de dados.`);
-                
-                const pedidoDoBanco = rows[0];
 
-                if (pedidoDoBanco.status === 'PAGO') {
-                    console.log(`Pedido ${pedidoId} já está com status PAGO. Nenhuma ação necessária.`);
-                    return res.status(200).send('Notificação para pedido já pago.');
-                }
+                if (rows.length > 0) {
+                    const pedidoDoBanco = rows[0];
 
-                const novoStatus = payment.status === 'approved' ? 'PAGO' : 'PAGAMENTO_PENDENTE';
-                
-                await db.query("UPDATE pedidos SET status = ?, mercado_pago_id = ? WHERE id = ?", [novoStatus, payment.id, pedidoId]);
-                console.log(`Status do Pedido #${pedidoId} atualizado para: ${novoStatus}`);
+                    if (pedidoDoBanco.status === 'PAGO') {
+                        console.log(`Pedido ${pedidoId} já está PAGO. Nenhuma ação necessária.`);
+                    } else {
+                        const novoStatus = payment.status === 'approved' ? 'PAGO' : 'PAGAMENTO_PENDENTE';
+                        
+                        if (pedidoDoBanco.status !== novoStatus) {
+                            await db.query("UPDATE pedidos SET status = ?, mercado_pago_id = ? WHERE id = ?", [novoStatus, payment.id, pedidoId]);
+                            console.log(`Status do Pedido #${pedidoId} atualizado para: ${novoStatus}`);
+                        }
 
-                if (novoStatus === 'PAGO') {
-                    await enviarEmailDeConfirmacao({ ...pedidoDoBanco, mercado_pago_id: payment.id });
-                }
-                
-                if (!pedidoDoBanco.melhor_envio_id) {
-                    try {
-                        await inserirPedidoNoCarrinhoME(pedidoDoBanco);
-                    } catch (meError) {
-                        console.error(`FALHA AO GERAR ETIQUETA MELHOR ENVIO para pedido #${pedidoId}:`, meError);
+                        if (novoStatus === 'PAGO') {
+                            await enviarEmailDeConfirmacao({ ...pedidoDoBanco, mercado_pago_id: payment.id });
+                        }
+                        
+                        if (!pedidoDoBanco.melhor_envio_id) {
+                            await inserirPedidoNoCarrinhoME(pedidoDoBanco);
+                        } else {
+                            console.log(`Etiqueta Melhor Envio para o pedido #${pedidoId} já foi gerada.`);
+                        }
                     }
-                } else {
-                    console.log(`Etiqueta Melhor Envio para o pedido #${pedidoId} já foi gerada anteriormente.`);
                 }
             }
+        } catch (error) {
+            console.error('ERRO AO PROCESSAR NOTIFICAÇÃO DE PAGAMENTO:', error);
         }
-        res.status(200).send('Notificação recebida');
-    } catch (error) {
-        console.error('ERRO AO PROCESSAR NOTIFICAÇÃO:', error);
-        res.status(500).send('Erro no servidor ao processar notificação.');
+    } else {
+        console.log(`LOG: Notificação do tipo '${topic}' recebida e ignorada.`);
     }
+    
+    res.status(200).send('Notificação recebida');
 });
 
 
 // --- FUNÇÃO AUXILIAR DE ENVIO DE E-MAIL ---
 async function enviarEmailDeConfirmacao(pedido) {
-    const itens = JSON.parse(pedido.itens_pedido);
-    const frete = JSON.parse(pedido.info_frete);
+    // ALTERAÇÃO AQUI: Verifica se o dado já é um objeto antes de fazer o parse
+    const itens = typeof pedido.itens_pedido === 'string' ? JSON.parse(pedido.itens_pedido) : pedido.itens_pedido;
+    const frete = typeof pedido.info_frete === 'string' ? JSON.parse(pedido.info_frete) : pedido.info_frete;
     
     const emailBody = `
       <h1>🎉 Pedido Confirmado! (Nº ${pedido.id})</h1>
       <p>Olá, ${pedido.nome_cliente}. Seu pagamento foi aprovado!</p>
       <p><strong>ID do Pagamento (Mercado Pago):</strong> ${pedido.mercado_pago_id}</p>
+      <hr>
+      <h2>Dados do Cliente</h2>
+      <p><strong>Nome:</strong> ${pedido.nome_cliente}</p>
+      <p><strong>E-mail:</strong> ${pedido.email_cliente}</p>
+      <p><strong>CPF:</strong> ${pedido.cpf_cliente}</p>
+      <p><strong>Telefone:</strong> ${pedido.telefone_cliente}</p>
       <hr>
       <h2>Endereço de Entrega</h2>
       <p>${pedido.endereco_entrega}</p>
@@ -273,69 +266,41 @@ async function enviarEmailDeConfirmacao(pedido) {
 async function inserirPedidoNoCarrinhoME(pedido) {
     console.log(`Iniciando inserção no carrinho Melhor Envio para o pedido #${pedido.id}`);
     
-    const itens = JSON.parse(pedido.itens_pedido);
-    const frete = JSON.parse(pedido.info_frete);
+    // ALTERAÇÃO AQUI: Verifica se o dado já é um objeto antes de fazer o parse
+    const itens = typeof pedido.itens_pedido === 'string' ? JSON.parse(pedido.itens_pedido) : pedido.itens_pedido;
+    const frete = typeof pedido.info_frete === 'string' ? JSON.parse(pedido.info_frete) : pedido.info_frete;
     const subtotal = itens.reduce((sum, item) => sum + item.unit_price * item.quantity, 0);
 
     const payload = {
         service: frete.code,
         from: {
-            name: SENDER_NAME,
-            phone: SENDER_PHONE.replace(/\D/g, ''),
-            email: SENDER_EMAIL,
-            document: SENDER_DOCUMENT.replace(/\D/g, ''),
-            address: SENDER_STREET,
-            complement: SENDER_COMPLEMENT,
-            number: SENDER_NUMBER,
-            district: SENDER_DISTRICT,
-            city: SENDER_CITY,
-            state_abbr: SENDER_STATE_ABBR,
-            country_id: "BR",
+            name: SENDER_NAME, phone: SENDER_PHONE.replace(/\D/g, ''), email: SENDER_EMAIL,
+            document: SENDER_DOCUMENT.replace(/\D/g, ''), address: SENDER_STREET,
+            complement: SENDER_COMPLEMENT, number: SENDER_NUMBER, district: SENDER_DISTRICT,
+            city: SENDER_CITY, state_abbr: SENDER_STATE_ABBR, country_id: "BR",
             postal_code: SENDER_CEP.replace(/\D/g, ''),
         },
         to: {
-            name: pedido.nome_cliente,
-            phone: pedido.telefone_cliente.replace(/\D/g, ''),
-            email: pedido.email_cliente,
-            document: pedido.cpf_cliente.replace(/\D/g, ''),
-            address: pedido.logradouro,
-            complement: pedido.complemento,
-            number: pedido.numero,
-            district: pedido.bairro,
-            city: pedido.cidade,
-            state_abbr: pedido.estado,
-            country_id: "BR",
-            postal_code: pedido.cep.replace(/\D/g, ''),
+            name: pedido.nome_cliente, phone: pedido.telefone_cliente.replace(/\D/g, ''),
+            email: pedido.email_cliente, document: pedido.cpf_cliente.replace(/\D/g, ''),
+            address: pedido.logradouro, complement: pedido.complemento, number: pedido.numero,
+            district: pedido.bairro, city: pedido.cidade, state_abbr: pedido.estado,
+            country_id: "BR", postal_code: pedido.cep.replace(/\D/g, ''),
         },
         products: itens.map(item => ({
-            name: item.title,
-            quantity: item.quantity,
-            unitary_value: item.unit_price,
-            weight: 0.3, 
-            width: 15,
-            height: 10,
-            length: 20,
+            name: item.title, quantity: item.quantity, unitary_value: item.unit_price,
+            weight: 0.3, width: 15, height: 10, length: 20,
         })),
         options: {
-            insurance_value: subtotal,
-            receipt: false,
-            own_hand: false,
-            reverse: false,
-            non_commercial: true,
-            tags: [
-                {
-                    tag: `Pedido #${pedido.id}`,
-                    url: null,
-                },
-            ],
+            insurance_value: subtotal, receipt: false, own_hand: false, reverse: false,
+            non_commercial: true, tags: [{ tag: `Pedido #${pedido.id}`, url: null }],
         },
     };
     
     const response = await fetch('https://www.melhorenvio.com.br/api/v2/me/cart', {
         method: 'POST',
         headers: {
-            'Accept': 'application/json',
-            'Content-Type': 'application/json',
+            'Accept': 'application/json', 'Content-Type': 'application/json',
             'Authorization': `Bearer ${MELHOR_ENVIO_TOKEN}`,
             'User-Agent': 'Sua Loja (contato@seusite.com)'
         },
@@ -343,7 +308,6 @@ async function inserirPedidoNoCarrinhoME(pedido) {
     });
 
     const data = await response.json();
-
     if (!response.ok) {
         console.error("Payload enviado para o Melhor Envio:", JSON.stringify(payload, null, 2));
         console.error("Resposta de erro do Melhor Envio:", data);
