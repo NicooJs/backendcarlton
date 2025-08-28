@@ -1,5 +1,5 @@
 /* ================================================================================ 
-|   ARQUIVO DO SERVIDOR BACKEND - ADAPTADO PARA FLUXO PROFISSIONAL COM BANCO     | 
+|   ARQUIVO DO SERVIDOR BACKEND - VERSÃO FINAL CORRIGIDA                       | 
 ================================================================================ */
 
 import express from 'express';
@@ -8,7 +8,7 @@ import { MercadoPagoConfig, Preference, Payment } from 'mercadopago';
 import dotenv from 'dotenv';
 import fetch from 'node-fetch';
 import nodemailer from 'nodemailer';
-import db from './db.js'; // Importa a conexão do banco de dados
+import db from './db.js';
 
 // --- CONFIGURAÇÃO INICIAL ---
 dotenv.config();
@@ -19,27 +19,11 @@ app.use(express.json());
 
 // --- VARIÁVEIS DE AMBIENTE ---
 const {
-    MP_ACCESS_TOKEN,
-    MELHOR_ENVIO_TOKEN,
-    SENDER_CEP,
-    BACKEND_URL,
-    FRONTEND_URL,
-    EMAIL_HOST,
-    EMAIL_PORT,
-    EMAIL_SECURE,
-    EMAIL_USER,
-    EMAIL_PASS,
-    EMAIL_TO,
-    SENDER_NAME,
-    SENDER_PHONE,
-    SENDER_EMAIL,
-    SENDER_DOCUMENT,
-    SENDER_STREET,
-    SENDER_NUMBER,
-    SENDER_COMPLEMENT,
-    SENDER_DISTRICT,
-    SENDER_CITY,
-    SENDER_STATE_ABBR
+    MP_ACCESS_TOKEN, MELHOR_ENVIO_TOKEN, SENDER_CEP, BACKEND_URL,
+    FRONTEND_URL, EMAIL_HOST, EMAIL_PORT, EMAIL_SECURE, EMAIL_USER,
+    EMAIL_PASS, EMAIL_TO, SENDER_NAME, SENDER_PHONE, SENDER_EMAIL,
+    SENDER_DOCUMENT, SENDER_STREET, SENDER_NUMBER, SENDER_COMPLEMENT,
+    SENDER_DISTRICT, SENDER_CITY, SENDER_STATE_ABBR
 } = process.env;
 
 // Validação das variáveis de ambiente
@@ -50,7 +34,6 @@ if (!MP_ACCESS_TOKEN || !MELHOR_ENVIO_TOKEN || !BACKEND_URL || !FRONTEND_URL || 
 
 // --- CONFIGURAÇÃO DOS SERVIÇOS ---
 const client = new MercadoPagoConfig({ accessToken: MP_ACCESS_TOKEN });
-
 const transporter = nodemailer.createTransport({
     host: EMAIL_HOST,
     port: parseInt(EMAIL_PORT, 10),
@@ -58,15 +41,125 @@ const transporter = nodemailer.createTransport({
     auth: { user: EMAIL_USER, pass: EMAIL_PASS },
 });
 
-
 // ------------------- ROTAS DA APLICAÇÃO -------------------
 
 // ROTA /criar-preferencia
 app.post('/criar-preferencia', async (req, res) => {
+    // ... (Esta rota não precisa de alterações)
+});
+
+// ROTA /calcular-frete
+app.post('/calcular-frete', async (req, res) => {
+    // ... (Esta rota não precisa de alterações)
+});
+
+// ROTA DE WEBHOOK PARA NOTIFICAÇÕES DO MERCADO PAGO
+app.post('/notificacao-pagamento', async (req, res) => {
+    // ... (Esta rota não precisa de alterações)
+});
+
+
+// --- FUNÇÃO AUXILIAR DE ENVIO DE E-MAIL ---
+async function enviarEmailDeConfirmacao(pedido) {
+    // ... (Esta função não precisa de alterações)
+}
+
+
+// --- FUNÇÃO: INSERIR PEDIDO NO CARRINHO DO MELHOR ENVIO ---
+async function inserirPedidoNoCarrinhoME(pedido) {
+    console.log(`Iniciando inserção no carrinho Melhor Envio para o pedido #${pedido.id}`);
+    
+    const itens = typeof pedido.itens_pedido === 'string' ? JSON.parse(pedido.itens_pedido) : pedido.itens_pedido;
+    const frete = typeof pedido.info_frete === 'string' ? JSON.parse(pedido.info_frete) : pedido.info_frete;
+    const subtotal = itens.reduce((sum, item) => sum + item.unit_price * item.quantity, 0);
+
+    // ===================================================================
+    // ALTERAÇÃO FINAL AQUI
+    // ===================================================================
+
+    // 1. Somamos o peso de todos os itens para criar um pacote único.
+    // Usamos o peso de 0.3kg que definimos no cálculo de frete.
+    const pesoTotal = itens.reduce((sum, item) => sum + (0.3 * item.quantity), 0);
+
+    const payload = {
+        service: frete.code,
+        from: {
+            name: SENDER_NAME, phone: SENDER_PHONE.replace(/\D/g, ''), email: SENDER_EMAIL,
+            document: SENDER_DOCUMENT.replace(/\D/g, ''), address: SENDER_STREET,
+            complement: SENDER_COMPLEMENT, number: SENDER_NUMBER, district: SENDER_DISTRICT,
+            city: SENDER_CITY, state_abbr: SENDER_STATE_ABBR, country_id: "BR",
+            postal_code: SENDER_CEP.replace(/\D/g, ''),
+        },
+        to: {
+            name: pedido.nome_cliente, phone: pedido.telefone_cliente.replace(/\D/g, ''),
+            email: pedido.email_cliente, document: pedido.cpf_cliente.replace(/\D/g, ''),
+            address: pedido.logradouro, complement: pedido.complemento, number: pedido.numero,
+            district: pedido.bairro, city: pedido.cidade, state_abbr: pedido.estado,
+            country_id: "BR", postal_code: pedido.cep.replace(/\D/g, ''),
+        },
+        // 2. O campo 'products' é usado para a declaração de conteúdo.
+        products: itens.map(item => ({
+            name: item.title,
+            quantity: item.quantity,
+            unitary_value: item.unit_price,
+        })),
+        // 3. O campo 'volumes' é usado para as dimensões e peso do pacote para o frete.
+        volumes: [
+            {
+                height: 10,
+                width: 15,
+                length: 20,
+                // Garantimos que o peso mínimo seja 0.01, como exigido pela API.
+                weight: pesoTotal < 0.01 ? 0.01 : pesoTotal
+            }
+        ],
+        options: {
+            insurance_value: subtotal,
+            receipt: false,
+            own_hand: false,
+            reverse: false,
+            non_commercial: true,
+            tags: [{ tag: `Pedido #${pedido.id}`, url: null }],
+        },
+    };
+    
+    // ===================================================================
+
+    const response = await fetch('https://www.melhorenvio.com.br/api/v2/me/cart', {
+        method: 'POST',
+        headers: {
+            'Accept': 'application/json', 'Content-Type': 'application/json',
+            'Authorization': `Bearer ${MELHOR_ENVIO_TOKEN}`,
+            'User-Agent': 'Sua Loja (contato@seusite.com)'
+        },
+        body: JSON.stringify(payload)
+    });
+
+    const data = await response.json();
+    if (!response.ok) {
+        console.error("Payload enviado para o Melhor Envio:", JSON.stringify(payload, null, 2));
+        console.error("Resposta de erro do Melhor Envio:", data);
+        throw new Error(JSON.stringify(data.error || 'Erro ao adicionar etiqueta ao carrinho do Melhor Envio.'));
+    }
+
+    const melhorEnvioId = data.id;
+    console.log(`SUCESSO! Pedido #${pedido.id} inserido no carrinho Melhor Envio com ID: ${melhorEnvioId}`);
+
+    await db.query("UPDATE pedidos SET melhor_envio_id = ? WHERE id = ?", [melhorEnvioId, pedido.id]);
+    console.log(`ID do Melhor Envio salvo no banco para o pedido #${pedido.id}.`);
+}
+
+// --- INICIALIZAÇÃO DO SERVIDOR ---
+app.listen(port, () => {
+    // ...
+});
+
+// Coloquei o código completo das outras funções que não mudaram abaixo, para você ter o arquivo inteiro.
+
+app.post('/criar-preferencia', async (req, res) => {
     console.log("LOG: Corpo da requisição recebido em /criar-preferencia:", JSON.stringify(req.body, null, 2));
     try {
         const { items, customerInfo, selectedShipping, shipmentCost } = req.body;
-
         if (!items || !customerInfo || !selectedShipping || shipmentCost === undefined) {
             return res.status(400).json({ error: 'Dados incompletos para criar a preferência.' });
         }
@@ -78,34 +171,21 @@ app.post('/criar-preferencia', async (req, res) => {
                 nome_cliente, email_cliente, cpf_cliente, telefone_cliente, 
                 endereco_entrega, cep, logradouro, numero, complemento, bairro, cidade, estado,
                 itens_pedido, info_frete, valor_total, status
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'AGUARDANDO_PAGAMENTO');`;
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'AGUARDANDO_PAGAMENTO');`;
 
         const [result] = await db.query(sql, [
-            `${customerInfo.firstName} ${customerInfo.lastName}`,
-            customerInfo.email,
-            customerInfo.cpf.replace(/\D/g, ''),
-            customerInfo.phone.replace(/\D/g, ''),
-            fullAddress,
-            customerInfo.cep.replace(/\D/g, ''),
-            customerInfo.address,
-            customerInfo.number,
-            customerInfo.complement,
-            customerInfo.neighborhood,
-            customerInfo.city,
-            customerInfo.state,
-            JSON.stringify(items),
-            JSON.stringify(selectedShipping),
-            total
+            `${customerInfo.firstName} ${customerInfo.lastName}`, customerInfo.email,
+            customerInfo.cpf.replace(/\D/g, ''), customerInfo.phone.replace(/\D/g, ''),
+            fullAddress, customerInfo.cep.replace(/\D/g, ''), customerInfo.address,
+            customerInfo.number, customerInfo.complement, customerInfo.neighborhood,
+            customerInfo.city, customerInfo.state, JSON.stringify(items),
+            JSON.stringify(selectedShipping), total
         ]);
         const novoPedidoId = result.insertId;
 
         const preferenceBody = {
-            items: items,
-            payer: {
-                first_name: customerInfo.firstName,
-                email: customerInfo.email,
-            },
+            items,
+            payer: { first_name: customerInfo.firstName, email: customerInfo.email },
             shipments: { cost: Number(shipmentCost) },
             external_reference: novoPedidoId.toString(),
             notification_url: `${BACKEND_URL}/notificacao-pagamento`,
@@ -121,15 +201,12 @@ app.post('/criar-preferencia', async (req, res) => {
 
         console.log(`SUCESSO! Pedido #${novoPedidoId} salvo no banco. Preferência ${preferenceResult.id} criada.`);
         res.status(201).json({ id: preferenceResult.id, init_point: preferenceResult.init_point });
-
     } catch (error) {
         console.error("ERRO AO CRIAR PREFERÊNCIA E SALVAR PEDIDO:", error);
         res.status(500).json({ error: 'Erro interno ao processar o pedido.' });
     }
 });
 
-
-// ROTA /calcular-frete
 app.post('/calcular-frete', async (req, res) => {
     console.log("LOG: Corpo da requisição recebido em /calcular-frete:", req.body);
     const { cepDestino, items } = req.body;
@@ -166,8 +243,6 @@ app.post('/calcular-frete', async (req, res) => {
     }
 });
 
-
-// ROTA DE WEBHOOK PARA NOTIFICAÇÕES DO MERCADO PAGO
 app.post('/notificacao-pagamento', async (req, res) => {
     console.log('LOG: Notificação recebida:', req.query);
     const topic = req.query.topic || req.query.type;
@@ -216,10 +291,7 @@ app.post('/notificacao-pagamento', async (req, res) => {
     res.status(200).send('Notificação recebida');
 });
 
-
-// --- FUNÇÃO AUXILIAR DE ENVIO DE E-MAIL ---
 async function enviarEmailDeConfirmacao(pedido) {
-    // ALTERAÇÃO AQUI: Verifica se o dado já é um objeto antes de fazer o parse
     const itens = typeof pedido.itens_pedido === 'string' ? JSON.parse(pedido.itens_pedido) : pedido.itens_pedido;
     const frete = typeof pedido.info_frete === 'string' ? JSON.parse(pedido.info_frete) : pedido.info_frete;
     
@@ -261,67 +333,6 @@ async function enviarEmailDeConfirmacao(pedido) {
     }
 }
 
-
-// --- FUNÇÃO: INSERIR PEDIDO NO CARRINHO DO MELHOR ENVIO ---
-async function inserirPedidoNoCarrinhoME(pedido) {
-    console.log(`Iniciando inserção no carrinho Melhor Envio para o pedido #${pedido.id}`);
-    
-    // ALTERAÇÃO AQUI: Verifica se o dado já é um objeto antes de fazer o parse
-    const itens = typeof pedido.itens_pedido === 'string' ? JSON.parse(pedido.itens_pedido) : pedido.itens_pedido;
-    const frete = typeof pedido.info_frete === 'string' ? JSON.parse(pedido.info_frete) : pedido.info_frete;
-    const subtotal = itens.reduce((sum, item) => sum + item.unit_price * item.quantity, 0);
-
-    const payload = {
-        service: frete.code,
-        from: {
-            name: SENDER_NAME, phone: SENDER_PHONE.replace(/\D/g, ''), email: SENDER_EMAIL,
-            document: SENDER_DOCUMENT.replace(/\D/g, ''), address: SENDER_STREET,
-            complement: SENDER_COMPLEMENT, number: SENDER_NUMBER, district: SENDER_DISTRICT,
-            city: SENDER_CITY, state_abbr: SENDER_STATE_ABBR, country_id: "BR",
-            postal_code: SENDER_CEP.replace(/\D/g, ''),
-        },
-        to: {
-            name: pedido.nome_cliente, phone: pedido.telefone_cliente.replace(/\D/g, ''),
-            email: pedido.email_cliente, document: pedido.cpf_cliente.replace(/\D/g, ''),
-            address: pedido.logradouro, complement: pedido.complemento, number: pedido.numero,
-            district: pedido.bairro, city: pedido.cidade, state_abbr: pedido.estado,
-            country_id: "BR", postal_code: pedido.cep.replace(/\D/g, ''),
-        },
-        products: itens.map(item => ({
-            name: item.title, quantity: item.quantity, unitary_value: item.unit_price,
-            weight: 0.3, width: 15, height: 10, length: 20,
-        })),
-        options: {
-            insurance_value: subtotal, receipt: false, own_hand: false, reverse: false,
-            non_commercial: true, tags: [{ tag: `Pedido #${pedido.id}`, url: null }],
-        },
-    };
-    
-    const response = await fetch('https://www.melhorenvio.com.br/api/v2/me/cart', {
-        method: 'POST',
-        headers: {
-            'Accept': 'application/json', 'Content-Type': 'application/json',
-            'Authorization': `Bearer ${MELHOR_ENVIO_TOKEN}`,
-            'User-Agent': 'Sua Loja (contato@seusite.com)'
-        },
-        body: JSON.stringify(payload)
-    });
-
-    const data = await response.json();
-    if (!response.ok) {
-        console.error("Payload enviado para o Melhor Envio:", JSON.stringify(payload, null, 2));
-        console.error("Resposta de erro do Melhor Envio:", data);
-        throw new Error(data.error || 'Erro ao adicionar etiqueta ao carrinho do Melhor Envio.');
-    }
-
-    const melhorEnvioId = data.id;
-    console.log(`SUCESSO! Pedido #${pedido.id} inserido no carrinho Melhor Envio com ID: ${melhorEnvioId}`);
-
-    await db.query("UPDATE pedidos SET melhor_envio_id = ? WHERE id = ?", [melhorEnvioId, pedido.id]);
-    console.log(`ID do Melhor Envio salvo no banco para o pedido #${pedido.id}.`);
-}
-
-// --- INICIALIZAÇÃO DO SERVIDOR ---
 app.listen(port, () => {
     console.log(`Servidor backend rodando na porta ${port}`);
 });
