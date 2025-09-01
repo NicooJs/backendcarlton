@@ -106,7 +106,23 @@ app.post('/calcular-frete', async (req, res) => {
     try {
         const cleanCepDestino = cepDestino.replace(/\D/g, '');
         const viaCepUrl = `https://viacep.com.br/ws/${cleanCepDestino}/json/`;
-        const viaCepResponse = await fetch(viaCepUrl);
+        
+        // Timeout para a requisição do ViaCEP
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 5000); // 5 segundos de timeout
+
+        let viaCepResponse;
+        try {
+            viaCepResponse = await fetch(viaCepUrl, { signal: controller.signal });
+            clearTimeout(timeoutId);
+        } catch (fetchError) {
+            console.error("ERRO ao conectar com ViaCEP:", fetchError);
+            if (fetchError.name === 'AbortError') {
+                return res.status(503).json({ error: 'Tempo limite excedido ao consultar o CEP. Por favor, tente novamente.' });
+            }
+            throw new Error('Não foi possível conectar com o serviço de CEP no momento.');
+        }
+
         const addressInfo = await viaCepResponse.json();
         if (addressInfo.erro) throw new Error("CEP de destino não encontrado.");
 
