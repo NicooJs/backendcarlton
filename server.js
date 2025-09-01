@@ -1,5 +1,5 @@
 /* ================================================================================ 
-|   ARQUIVO DO SERVIDOR BACKEND - VERSÃO FINAL E CORRIGIDA                         | 
+|   ARQUIVO DO SERVIDOR BACKEND - VERSÃO FINAL E CORRIGIDA                        | 
 ================================================================================ */
 
 import express from 'express';
@@ -57,10 +57,10 @@ app.post('/criar-preferencia', async (req, res) => {
         const fullAddress = `${customerInfo.address}, ${customerInfo.number} ${customerInfo.complement || ''} - ${customerInfo.neighborhood}, ${customerInfo.city}/${customerInfo.state}, CEP: ${customerInfo.cep}`;
         
         const sql = `INSERT INTO pedidos (
-                nome_cliente, email_cliente, cpf_cliente, telefone_cliente, 
-                endereco_entrega, cep, logradouro, numero, complemento, bairro, cidade, estado,
-                itens_pedido, info_frete, valor_total, status
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'AGUARDANDO_PAGAMENTO');`;
+            nome_cliente, email_cliente, cpf_cliente, telefone_cliente, 
+            endereco_entrega, cep, logradouro, numero, complemento, bairro, cidade, estado,
+            itens_pedido, info_frete, valor_total, status
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'AGUARDANDO_PAGAMENTO');`;
 
         const [result] = await db.query(sql, [
             `${customerInfo.firstName} ${customerInfo.lastName}`, customerInfo.email,
@@ -96,7 +96,7 @@ app.post('/criar-preferencia', async (req, res) => {
     }
 });
 
-// ROTA /calcular-frete  ✅ CORRIGIDA
+// ROTA /calcular-frete 
 app.post('/calcular-frete', async (req, res) => {
     console.log("LOG: Corpo da requisição recebido em /calcular-frete:", req.body);
     const { cepDestino, items } = req.body;
@@ -233,27 +233,27 @@ async function enviarEmailDeConfirmacao(pedido) {
     const frete = typeof pedido.info_frete === 'string' ? JSON.parse(pedido.info_frete) : pedido.info_frete;
     
     const emailBody = `
-      <h1>🎉 Pedido Confirmado! (Nº ${pedido.id})</h1>
-      <p>Olá, ${pedido.nome_cliente}. Seu pagamento foi aprovado!</p>
-      <p><strong>ID do Pagamento (Mercado Pago):</strong> ${pedido.mercado_pago_id}</p>
-      <hr>
-      <h2>Dados do Cliente</h2>
-      <p><strong>Nome:</strong> ${pedido.nome_cliente}</p>
-      <p><strong>E-mail:</strong> ${pedido.email_cliente}</p>
-      <p><strong>CPF:</strong> ${pedido.cpf_cliente}</p>
-      <p><strong>Telefone:</strong> ${pedido.telefone_cliente}</p>
-      <hr>
-      <h2>Endereço de Entrega</h2>
-      <p>${pedido.endereco_entrega}</p>
-      <hr>
-      <h2>Detalhes do Pedido</h2>
-      <ul>
+        <h1>🎉 Pedido Confirmado! (Nº ${pedido.id})</h1>
+        <p>Olá, ${pedido.nome_cliente}. Seu pagamento foi aprovado!</p>
+        <p><strong>ID do Pagamento (Mercado Pago):</strong> ${pedido.mercado_pago_id}</p>
+        <hr>
+        <h2>Dados do Cliente</h2>
+        <p><strong>Nome:</strong> ${pedido.nome_cliente}</p>
+        <p><strong>E-mail:</strong> ${pedido.email_cliente}</p>
+        <p><strong>CPF:</strong> ${pedido.cpf_cliente}</p>
+        <p><strong>Telefone:</strong> ${pedido.telefone_cliente}</p>
+        <hr>
+        <h2>Endereço de Entrega</h2>
+        <p>${pedido.endereco_entrega}</p>
+        <hr>
+        <h2>Detalhes do Pedido</h2>
+        <ul>
         ${itens.map(item => `<li>${item.quantity}x ${item.title} - R$ ${Number(item.unit_price).toFixed(2)} cada</li>`).join('')}
-      </ul>
-      <hr>
-      <h2>Valores</h2>
-      <p><strong>Frete (${frete.name}):</strong> R$ ${Number(frete.price).toFixed(2)}</p>
-      <h3><strong>Total:</strong> R$ ${Number(pedido.valor_total).toFixed(2)}</h3>
+        </ul>
+        <hr>
+        <h2>Valores</h2>
+        <p><strong>Frete (${frete.name}):</strong> R$ ${Number(frete.price).toFixed(2)}</p>
+        <h3><strong>Total:</strong> R$ ${Number(pedido.valor_total).toFixed(2)}</h3>
     `;
 
     try {
@@ -271,7 +271,7 @@ async function enviarEmailDeConfirmacao(pedido) {
 }
 
 
-// --- FUNÇÃO: INSERIR PEDIDO NO CARRINHO DO MELHOR ENVIO ✅ CORRIGIDA ---
+// --- FUNÇÃO: INSERIR PEDIDO NO CARRINHO DO MELHOR ENVIO ---
 async function inserirPedidoNoCarrinhoME(pedido) {
     console.log(`Iniciando inserção no carrinho Melhor Envio para o pedido #${pedido.id}`);
     
