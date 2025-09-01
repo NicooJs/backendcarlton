@@ -103,28 +103,30 @@ app.post('/calcular-frete', async (req, res) => {
     if (!cepDestino || !items || items.length === 0) {
         return res.status(400).json({ error: 'CEP de destino e lista de itens são obrigatórios.' });
     }
+
     try {
         const cleanCepDestino = cepDestino.replace(/\D/g, '');
         const viaCepUrl = `https://viacep.com.br/ws/${cleanCepDestino}/json/`;
-        
-        // Timeout para a requisição do ViaCEP
-        const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 5000); // 5 segundos de timeout
+        let addressInfo;
+        let attempts = 0;
+        const maxAttempts = 3;
 
-        let viaCepResponse;
-        try {
-            viaCepResponse = await fetch(viaCepUrl, { signal: controller.signal });
-            clearTimeout(timeoutId);
-        } catch (fetchError) {
-            console.error("ERRO ao conectar com ViaCEP:", fetchError);
-            if (fetchError.name === 'AbortError') {
-                return res.status(503).json({ error: 'Tempo limite excedido ao consultar o CEP. Por favor, tente novamente.' });
+        while (attempts < maxAttempts) {
+            try {
+                const viaCepResponse = await fetch(viaCepUrl);
+                addressInfo = await viaCepResponse.json();
+                if (addressInfo.erro) throw new Error("CEP de destino não encontrado.");
+                break; // Sai do loop se a requisição for bem-sucedida
+            } catch (error) {
+                attempts++;
+                if (attempts === maxAttempts) {
+                    console.error("ERRO FATAL ao conectar com ViaCEP após 3 tentativas:", error);
+                    throw new Error('Não foi possível conectar com o serviço de CEP no momento. Por favor, tente novamente mais tarde.');
+                }
+                console.warn(`Tentativa ${attempts} de conectar com ViaCEP falhou. Tentando novamente...`);
+                await new Promise(resolve => setTimeout(resolve, 1000 * attempts)); // Espera antes de tentar novamente
             }
-            throw new Error('Não foi possível conectar com o serviço de CEP no momento.');
         }
-
-        const addressInfo = await viaCepResponse.json();
-        if (addressInfo.erro) throw new Error("CEP de destino não encontrado.");
 
         const subtotal = items.reduce((sum, item) => sum + (item.unit_price * item.quantity), 0);
 
