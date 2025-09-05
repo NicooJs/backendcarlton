@@ -1,5 +1,5 @@
 /* ================================================================================
-|                                  Feito 100% por Nicolas Arantes                  |
+|                                 Feito 100% por Nicolas Arantes                                 |
 ================================================================================ */
 
 import express from 'express';
@@ -178,7 +178,7 @@ app.post('/calcular-frete', async (req, res) => {
                 'Accept': 'application/json', 
                 'Content-Type': 'application/json', 
                 'Authorization': `Bearer ${MELHOR_ENVIO_TOKEN}`, 
-                'User-Agent': 'Sua Loja (contato@seusite.com)'
+                'User-Agent': 'Carlton (carltoncoletivo@audionoiseskatevisual.com)'
             },
             body: JSON.stringify(shipmentPayload)
         });
@@ -318,7 +318,12 @@ app.post('/webhook-melhorenvio', async (req, res) => {
     }
 });
 
-// 1. ROTA PARA CHECAR PEDIDOS EXPIRADOS
+// --- ALTERAÇÃO INSERIDA ---
+// ROTA PARA CHECAR PEDIDOS EXPIRADOS
+// ATENÇÃO: Esta é uma rota de acionamento manual.
+// Para uma solução automatizada e robusta, configure um Cron Job 
+// na sua plataforma de hospedagem (Railway, etc.) para chamar esta URL
+// a cada 5 ou 10 minutos.
 app.get('/checar-pedidos-expirados', async (req, res) => {
     console.log("LOG: Iniciando checagem de pedidos expirados.");
     try {
@@ -365,7 +370,7 @@ async function enviarEmailDeConfirmacao(pedido) {
 
     try {
         await transporter.sendMail({
-            from: `"Sua Loja" <${EMAIL_USER}>`,
+            from: `"Carlton" <${EMAIL_USER}>`,
             to: EMAIL_TO,
             bcc: pedido.email_cliente,
             subject: `Confirmação do Pedido #${pedido.id}`,
@@ -389,7 +394,7 @@ async function enviarEmailComRastreio(pedido, trackingCode) {
 
     try {
         await transporter.sendMail({
-            from: `"Sua Loja" <${EMAIL_USER}>`,
+            from: `"Carlton" <${EMAIL_USER}>`,
             to: pedido.email_cliente,
             subject: `Código de Rastreio - Pedido #${pedido.id}`,
             html: emailBody,
@@ -482,7 +487,7 @@ async function inserirPedidoNoCarrinhoME(pedido) {
         headers: {
             'Accept': 'application/json', 'Content-Type': 'application/json',
             'Authorization': `Bearer ${MELHOR_ENVIO_TOKEN}`,
-            'User-Agent': 'Sua Loja (contato@seusite.com)'
+            'User-Agent': 'Carlton (carltoncoletivo@audionoiseskatevisual.com)'
         },
         body: JSON.stringify(payload)
     });
@@ -493,6 +498,19 @@ async function inserirPedidoNoCarrinhoME(pedido) {
         console.error("Resposta de erro do Melhor Envio:", data);
         throw new Error(JSON.stringify(data.error || 'Erro ao inserir no carrinho Melhor Envio.'));
     }
+    
+    // --- ALTERAÇÃO INSERIDA ---
+    // Pega o ID retornado pelo Melhor Envio e salva no nosso banco de dados.
+    // Isso é ESSENCIAL para que o webhook de rastreio funcione.
+    const melhorEnvioId = data.id;
+    if (melhorEnvioId) {
+        await db.query(
+            "UPDATE pedidos SET melhor_envio_id = ? WHERE id = ?",
+            [melhorEnvioId, pedido.id]
+        );
+        console.log(`ID do Melhor Envio (${melhorEnvioId}) salvo para o pedido #${pedido.id}.`);
+    }
+    // --- FIM DA ALTERAÇÃO ---
 
     console.log(`Pedido #${pedido.id} inserido no carrinho do Melhor Envio com sucesso.`);
 }
