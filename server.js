@@ -528,7 +528,6 @@ app.post('/rastrear-pedido', async (req, res) => {
     try {
         const cpfLimpo = cpf.replace(/\D/g, '');
 
-        // 1. QUERY CORRIGIDA: Removendo as colunas de data que não existem na sua tabela
         const sql = `
             SELECT 
                 id, nome_cliente, status, codigo_rastreio, 
@@ -548,9 +547,16 @@ app.post('/rastrear-pedido', async (req, res) => {
         }
         
         const pedidoDoBanco = rows[0];
+        
+        const itens = typeof pedidoDoBanco.itens_pedido === 'string' 
+            ? JSON.parse(pedidoDoBanco.itens_pedido) 
+            : pedidoDoBanco.itens_pedido || [];
 
-        // TRANSFORMAÇÃO DOS DADOS...
-        const itensFormatados = JSON.parse(pedidoDoBanco.itens_pedido || '[]').map(item => ({
+        const freteInfo = typeof pedidoDoBanco.info_frete === 'string'
+            ? JSON.parse(pedidoDoBanco.info_frete)
+            : pedidoDoBanco.info_frete || {};
+        
+        const itensFormatados = itens.map(item => ({
             id: item.id,
             nome: item.title,
             quantidade: item.quantity,
@@ -558,17 +564,12 @@ app.post('/rastrear-pedido', async (req, res) => {
             imagemUrl: item.picture_url
         }));
 
-        const freteInfo = JSON.parse(pedidoDoBanco.info_frete || '{}');
-
-        // 2. OBJETO DE RESPOSTA CORRIGIDO: Definindo as datas como 'null'
         const dadosFormatadosParaFrontend = {
             id: pedidoDoBanco.id,
             status: pedidoDoBanco.status,
             codigo_rastreio: pedidoDoBanco.codigo_rastreio,
-            
-            // Como não temos essas datas no banco, enviamos null para o frontend não quebrar
             data_pagamento: null,
-            data_producao: null, // O frontend também espera esta data
+            data_producao: null,
             data_envio: null,
             data_entrega: null,
             data_prevista_entrega: null,
