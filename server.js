@@ -518,51 +518,40 @@ async function inserirPedidoNoCarrinhoME(pedido) {
 // ROTA PARA O CLIENTE RASTREAR O PEDIDO (VERSÃO CORRETA E LIMPA)
 // ROTA PARA O CLIENTE RASTREAR O PEDIDO (VERSÃO MELHORADA HÍBRIDA)
 app.post('/rastrear-pedido', async (req, res) => {
-    console.log("LOG: Recebida solicitação para rastrear:", req.body);
+    console.log("LOG: Recebida solicitação para rastrear pedido por CPF:", req.body);
     
-    // Agora o primeiro campo pode ser o ID do pedido OU o código de rastreio
-    const { pedidoId: identificador, email } = req.body;
+    // Agora esperamos 'cpf' e 'email' no corpo da requisição
+    const { cpf, email } = req.body;
 
-    if (!identificador || !email) {
-        return res.status(400).json({ error: 'Identificador do pedido e e-mail são obrigatórios.' });
+    if (!cpf || !email) {
+        return res.status(400).json({ error: 'CPF e e-mail são obrigatórios.' });
     }
 
     try {
-        let sql;
-        let params;
+        // Limpamos o CPF para remover pontos e traços, garantindo a busca correta
+        const cpfLimpo = cpf.replace(/\D/g, '');
 
-        // Verificamos se o identificador é um número. Se for, buscamos pelo ID do pedido.
-        // O `!isNaN` checa se o valor NÃO é "Not-a-Number".
-        if (!isNaN(identificador)) {
-            console.log(`Buscando pelo NÚMERO DO PEDIDO: ${identificador}`);
-            sql = `
-                SELECT id, status, codigo_rastreio, data_criacao 
-                FROM pedidos 
-                WHERE id = ? AND email_cliente = ?
-            `;
-            params = [parseInt(identificador, 10), email];
-        } 
-        // Se não for um número puro, asumimos que é um CÓDIGO DE RASTREIO.
-        else {
-            console.log(`Buscando pelo CÓDIGO DE RASTREIO: ${identificador}`);
-            sql = `
-                SELECT id, status, codigo_rastreio, data_criacao 
-                FROM pedidos 
-                WHERE codigo_rastreio = ? AND email_cliente = ?
-            `;
-            params = [identificador, email];
-        }
-
-        const [rows] = await db.query(sql, params);
+        // A query agora busca na coluna 'cpf_cliente'
+        // Adicionamos "ORDER BY data_criacao DESC LIMIT 1" para pegar o pedido mais recente
+        const sql = `
+            SELECT id, status, codigo_rastreio, data_criacao 
+            FROM pedidos 
+            WHERE cpf_cliente = ? AND email_cliente = ?
+            ORDER BY data_criacao DESC 
+            LIMIT 1;
+        `;
+        
+        const [rows] = await db.query(sql, [cpfLimpo, email]);
 
         if (rows.length === 0) {
-            return res.status(404).json({ error: 'Pedido não encontrado. Verifique os dados e tente novamente.' });
+            return res.status(404).json({ error: 'Nenhum pedido encontrado para o CPF e e-mail informados.' });
         }
         
+        // Retorna os dados do pedido mais recente encontrado
         res.status(200).json(rows[0]);
 
     } catch (error) {
-        console.error("ERRO AO BUSCAR PEDIDO:", error);
+        console.error("ERRO AO BUSCAR PEDIDO PELO CPF:", error);
         res.status(500).json({ error: 'Ocorreu um erro interno. Por favor, tente mais tarde.' });
     }
 });
