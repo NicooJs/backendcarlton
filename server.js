@@ -72,23 +72,25 @@ app.post('/criar-preferencia', async (req, res) => {
         const novoPedidoId = result.insertId;
 
         // Expiração de 5 minutos para pagamento PIX
-        const now = new Date();
-        const expiresAt = new Date(now.getTime() + 5 * 60 * 1000).toISOString();
+        // Expiração de 5 minutos para pagamento PIX
+const now = new Date();
+const expiresAt = new Date(now.getTime() + 5 * 60 * 1000).toISOString();
 
-        const preferenceBody = {
-            items,
-            payer: { first_name: customerInfo.firstName, email: customerInfo.email },
-            shipments: { cost: Number(shipmentCost) },
-            external_reference: novoPedidoId.toString(),
-            notification_url: `${BACKEND_URL}/notificacao-pagamento`,
-            back_urls: {
-                success: `${FRONTEND_URL}/sucesso`,
-                failure: `${FRONTEND_URL}/falha`,
-                pending: `${FRONTEND_URL}/pendente`
-            },
-            expires: true,
-            expiration_date_to: expiresAt
-        };
+const preferenceBody = {
+    items,
+    payer: { first_name: customerInfo.firstName, email: customerInfo.email },
+    shipments: { cost: Number(shipmentCost) },
+    external_reference: novoPedidoId.toString(),
+    notification_url: `${BACKEND_URL}/notificacao-pagamento`,
+    back_urls: {
+        success: `${FRONTEND_URL}/sucesso`,
+        failure: `${FRONTEND_URL}/falha`,
+        pending: `${FRONTEND_URL}/pendente`
+    },
+    expires: true,
+    expiration_date_from: now.toISOString(),  // início da validade
+    expiration_date_to: expiresAt             // expira em 5 minutos
+};
 
         const preference = new Preference(client);
         const preferenceResult = await preference.create({ body: preferenceBody });
