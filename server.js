@@ -1,5 +1,5 @@
-/* ================================================================================ 
-|                     Feito 100% por Nicolas Arantes                  | 
+/* ================================================================================
+|                                  Feito 100% por Nicolas Arantes                  |
 ================================================================================ */
 
 import express from 'express';
@@ -9,13 +9,21 @@ import dotenv from 'dotenv';
 import fetch from 'node-fetch';
 import nodemailer from 'nodemailer';
 import db from './db.js';
+import crypto from 'crypto';
 
 // --- CONFIGURAÇÃO INICIAL ---
 dotenv.config();
 const app = express();
 const port = process.env.PORT || 4000;
 app.use(cors());
-app.use(express.json());
+
+// A body-parser precisa ser configurada com `verify` para ler o buffer da requisição,
+// que é necessário para validar a assinatura do webhook.
+app.use(express.json({
+    verify: (req, res, buf) => {
+        req.rawBody = buf;
+    }
+}));
 
 // --- VARIÁVEIS DE AMBIENTE ---
 const {
@@ -23,11 +31,11 @@ const {
     FRONTEND_URL, EMAIL_HOST, EMAIL_PORT, EMAIL_SECURE, EMAIL_USER,
     EMAIL_PASS, EMAIL_TO, SENDER_NAME, SENDER_PHONE, SENDER_EMAIL,
     SENDER_DOCUMENT, SENDER_STREET, SENDER_NUMBER, SENDER_COMPLEMENT,
-    SENDER_DISTRICT, SENDER_CITY, SENDER_STATE_ABBR
+    SENDER_DISTRICT, SENDER_CITY, SENDER_STATE_ABBR, MP_WEBHOOK_SECRET
 } = process.env;
 
 // Validação das variáveis de ambiente
-if (!MP_ACCESS_TOKEN || !MELHOR_ENVIO_TOKEN || !BACKEND_URL || !FRONTEND_URL || !EMAIL_USER || !db) {
+if (!MP_ACCESS_TOKEN || !MELHOR_ENVIO_TOKEN || !BACKEND_URL || !FRONTEND_URL || !EMAIL_USER || !db || !MP_WEBHOOK_SECRET) {
     console.error("ERRO CRÍTICO: Verifique todas as variáveis de ambiente e a conexão com o banco de dados.");
     process.exit(1);
 }
@@ -58,8 +66,11 @@ app.post('/criar-preferencia', async (req, res) => {
         const sql = `INSERT INTO pedidos (
             nome_cliente, email_cliente, cpf_cliente, telefone_cliente, 
             endereco_entrega, cep, logradouro, numero, complemento, bairro, cidade, estado,
-            itens_pedido, info_frete, valor_total, status
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'AGUARDANDO_PAGAMENTO');`;
+            itens_pedido, info_frete, valor_total, status, expiracao_pix
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'AGUARDANDO_PAGAMENTO', ?);`;
+
+        // Define a expiração em 30 minutos para o PIX, para uso interno
+        const expiracaoPix = new Date(Date.now() + 30 * 60 * 1000);
 
         const [result] = await db.query(sql, [
             `${customerInfo.firstName} ${customerInfo.lastName}`, customerInfo.email,
@@ -67,31 +78,29 @@ app.post('/criar-preferencia', async (req, res) => {
             fullAddress, customerInfo.cep.replace(/\D/g, ''), customerInfo.address,
             customerInfo.number, customerInfo.complement, customerInfo.neighborhood,
             customerInfo.city, customerInfo.state, JSON.stringify(items),
-            JSON.stringify(selectedShipping), total
+            JSON.stringify(selectedShipping), total, expiracaoPix
         ]);
         const novoPedidoId = result.insertId;
 
-        // Expiração de 5 minutos para pagamento PIX
-        // Expiração de 5 minutos para pagamento PIX
-// Expiração de 1 hora para o Checkout Pro
-const now = new Date();
-const expiresAt = new Date(now.getTime() + 60 * 60 * 1000).toISOString(); // +1 hora
+        // Expiração de 1 hora para o Checkout Pro
+        const now = new Date();
+        const expiresAt = new Date(now.getTime() + 60 * 60 * 1000).toISOString(); // +1 hora
 
-const preferenceBody = {
-    items,
-    payer: { first_name: customerInfo.firstName, email: customerInfo.email },
-    shipments: { cost: Number(shipmentCost) },
-    external_reference: novoPedidoId.toString(),
-    notification_url: `${BACKEND_URL}/notificacao-pagamento`,
-    back_urls: {
-        success: `${FRONTEND_URL}/sucesso`,
-        failure: `${FRONTEND_URL}/falha`,
-        pending: `${FRONTEND_URL}/pendente`
-    },
-    expires: true,
-    expiration_date_from: now.toISOString(),
-    expiration_date_to: expiresAt
-};
+        const preferenceBody = {
+            items,
+            payer: { first_name: customerInfo.firstName, email: customerInfo.email },
+            shipments: { cost: Number(shipmentCost) },
+            external_reference: novoPedidoId.toString(),
+            notification_url: `${BACKEND_URL}/notificacao-pagamento`,
+            back_urls: {
+                success: `${FRONTEND_URL}/sucesso`,
+                failure: `${FRONTEND_URL}/falha`,
+                pending: `${FRONTEND_URL}/pendente`
+            },
+            expires: true,
+            expiration_date_from: now.toISOString(),
+            expiration_date_to: expiresAt
+        };
 
 
         const preference = new Preference(client);
@@ -105,7 +114,7 @@ const preferenceBody = {
     }
 });
 
-// ROTA /calcular-frete 
+// ROTA /calcular-frete
 app.post('/calcular-frete', async (req, res) => {
     console.log("LOG: Corpo da requisição recebido em /calcular-frete:", req.body);
     const { cepDestino, items } = req.body;
@@ -206,6 +215,22 @@ app.post('/calcular-frete', async (req, res) => {
 
 // ROTA DE WEBHOOK PARA NOTIFICAÇÕES DO MERCADO PAGO
 app.post('/notificacao-pagamento', async (req, res) => {
+    // 3. Validação de Webhooks
+    const signature = req.headers['x-signature'];
+    const parts = signature.split(',');
+    const timestamp = parts.find(p => p.startsWith('ts=')).replace('ts=', '');
+    const signatureHash = parts.find(p => p.startsWith('v1=')).replace('v1=', '');
+
+    const message = `id:${req.query.id};ts:${timestamp};`;
+    const hmac = crypto.createHmac('sha256', MP_WEBHOOK_SECRET);
+    hmac.update(message);
+    const expectedSignature = hmac.digest('hex');
+
+    if (expectedSignature !== signatureHash) {
+        console.error("ERRO DE SEGURANÇA: Assinatura do webhook inválida. Possível fraude.");
+        return res.status(401).send('Invalid signature');
+    }
+
     console.log('LOG: Notificação recebida:', req.query);
     const topic = req.query.topic || req.query.type;
 
@@ -270,6 +295,28 @@ app.post('/webhook-melhorenvio', async (req, res) => {
     }
 });
 
+// 1. ROTA PARA CHECAR PEDIDOS EXPIRADOS
+app.get('/checar-pedidos-expirados', async (req, res) => {
+    console.log("LOG: Iniciando checagem de pedidos expirados.");
+    try {
+        const [pedidosExpirados] = await db.query(
+            "SELECT * FROM pedidos WHERE status = 'AGUARDANDO_PAGAMENTO' AND expiracao_pix < NOW();"
+        );
+        
+        for (const pedido of pedidosExpirados) {
+            await db.query("UPDATE pedidos SET status = 'CANCELADO_POR_EXPIRACAO' WHERE id = ?", [pedido.id]);
+            // 2. E-mail de Expiração
+            await enviarEmailDeExpiracao(pedido);
+            console.log(`Pedido #${pedido.id} cancelado por expiração e e-mail enviado.`);
+        }
+
+        res.status(200).json({ message: `Checagem concluída. ${pedidosExpirados.length} pedidos atualizados.` });
+    } catch (error) {
+        console.error("ERRO ao checar pedidos expirados:", error.message, error.stack);
+        res.status(500).json({ error: "Erro interno na checagem de pedidos." });
+    }
+});
+
 // --- FUNÇÃO AUXILIAR DE ENVIO DE E-MAIL ---
 async function enviarEmailDeConfirmacao(pedido) {
     const itens = typeof pedido.itens_pedido === 'string' ? JSON.parse(pedido.itens_pedido) : pedido.itens_pedido;
@@ -303,7 +350,7 @@ async function enviarEmailDeConfirmacao(pedido) {
         });
         console.log(`E-mail de confirmação para o pedido #${pedido.id} enviado com sucesso.`);
     } catch (error) {
-        console.error(`ERRO ao enviar e-mail para o pedido #${pedido.id}:`, error);
+        console.error(`ERRO ao enviar e-mail para o pedido #${pedido.id}:`, error.message, error.stack);
     }
 }
 
@@ -326,7 +373,34 @@ async function enviarEmailComRastreio(pedido, trackingCode) {
         });
         console.log(`E-mail de rastreio enviado para o pedido #${pedido.id}.`);
     } catch (error) {
-        console.error(`Erro ao enviar e-mail de rastreio para o pedido #${pedido.id}:`, error);
+        console.error(`Erro ao enviar e-mail de rastreio para o pedido #${pedido.id}:`, error.message, error.stack);
+    }
+}
+
+// --- FUNÇÃO: ENVIAR E-MAIL DE EXPIRAÇÃO DE PIX ---
+async function enviarEmailDeExpiracao(pedido) {
+    const emailBody = `
+        <h1>⚠️ Pagamento não confirmado para o Pedido #${pedido.id}</h1>
+        <p>Olá, ${pedido.nome_cliente}.</p>
+        <p>Notamos que o pagamento referente ao seu pedido <strong>#${pedido.id}</strong> ainda não foi confirmado.</p>
+        <p>O link para pagamento via PIX expirou para evitar pagamentos duplicados ou fraudes. Se ainda deseja adquirir os produtos, por favor, realize um novo pedido em nosso site.</p>
+        <p>Se você já pagou e acha que isso foi um engano, por favor, entre em contato conosco com o comprovante de pagamento.</p>
+        <hr>
+        <p>Agradecemos a sua compreensão.</p>
+        <p>Atenciosamente,</p>
+        <p>Equipe Carlton</p>
+    `;
+
+    try {
+        await transporter.sendMail({
+            from: `"Carlton" <${EMAIL_USER}>`,
+            to: pedido.email_cliente,
+            subject: `Aviso: Pagamento Pendente para o Pedido #${pedido.id}`,
+            html: emailBody,
+        });
+        console.log(`E-mail de expiração enviado para o pedido #${pedido.id}.`);
+    } catch (error) {
+        console.error(`Erro ao enviar e-mail de expiração para o pedido #${pedido.id}:`, error.message, error.stack);
     }
 }
 
