@@ -516,25 +516,38 @@ async function inserirPedidoNoCarrinhoME(pedido) {
 }
 // ROTA PARA O CLIENTE RASTREAR O PEDIDO
 app.post('/rastrear-pedido', async (req, res) => {
-    console.log("LOG: Recebida solicitação para rastrear pedido:", req.body);
-    const { pedidoId, email } = req.body;
+    console.log("LOG: Recebida solicitação para rastrear pedido:", req.body);
+   
+    // O frontend está enviando o código de rastreio no campo 'pedidoId'
+    const { pedidoId: codigoRastreio, email } = req.body;
 
-    if (!pedidoId || !email) {
-        return res.status(400).json({ error: 'Número do pedido e e-mail são obrigatórios.' });
-    }
+    if (!codigoRastreio || !email) {
+        return res.status(400).json({ error: 'Código de rastreio e e-mail são obrigatórios.' });
+    }
 
-    try {
-        const sql = `
-            SELECT id, status, codigo_rastreio, data_criacao 
-            FROM pedidos 
-            WHERE id = ? AND email_cliente = ?
-        `;
-        const [rows] = await db.query(sql, [pedidoId, email]);
+    try {
+        // A query agora busca na coluna correta: 'codigo_rastreio'
+        const sql = `
+            SELECT id, status, codigo_rastreio, data_criacao 
+            FROM pedidos 
+            WHERE codigo_rastreio = ? AND email_cliente = ?
+        `;
+        // Usamos a variável 'codigoRastreio' que pegamos do 'pedidoId'
+        const [rows] = await db.query(sql, [codigoRastreio, email]);
 
-        if (rows.length === 0) {
-            return res.status(404).json({ error: 'Pedido não encontrado ou e-mail incorreto. Verifique os dados e tente novamente.' });
-        }
-        
+        if (rows.length === 0) {
+            // Mensagem de erro mais específica para o usuário
+            return res.status(404).json({ error: 'Código de rastreio não encontrado ou e-mail incorreto. Verifique os dados e tente novamente.' });
+        }
+        
+        // Retorna os dados do pedido encontrado
+        res.status(200).json(rows[0]);
+
+    } catch (error) {
+        console.error("ERRO AO BUSCAR PEDIDO PELO CÓDIGO DE RASTREIO:", error);
+        res.status(500).json({ error: 'Ocorreu um erro interno. Por favor, tente mais tarde.' });
+    }
+});
         // Retornamos apenas os dados seguros para o cliente
         res.status(200).json(rows[0]);
 
