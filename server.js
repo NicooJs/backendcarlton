@@ -528,13 +528,13 @@ app.post('/rastrear-pedido', async (req, res) => {
     try {
         const cpfLimpo = cpf.replace(/\D/g, '');
 
-        // 1. QUERY MODIFICADA: Buscando todos os campos necessários
+        // 1. QUERY CORRIGIDA: Removendo as colunas de data que não existem na sua tabela
         const sql = `
             SELECT 
                 id, nome_cliente, status, codigo_rastreio, 
                 logradouro, bairro, cidade, estado, cep, numero, complemento,
                 itens_pedido, info_frete, valor_total,
-                data_criacao, data_pagamento, data_envio, data_entrega 
+                data_criacao
             FROM pedidos 
             WHERE cpf_cliente = ? AND email_cliente = ?
             ORDER BY data_criacao DESC 
@@ -549,10 +549,10 @@ app.post('/rastrear-pedido', async (req, res) => {
         
         const pedidoDoBanco = rows[0];
 
-        // 2. TRANSFORMAÇÃO DOS DADOS: Formatando para o que o frontend espera
+        // TRANSFORMAÇÃO DOS DADOS...
         const itensFormatados = JSON.parse(pedidoDoBanco.itens_pedido || '[]').map(item => ({
             id: item.id,
-            nome: item.title, // Mapeando 'title' para 'nome'
+            nome: item.title,
             quantidade: item.quantity,
             preco: parseFloat(item.unit_price),
             imagemUrl: item.picture_url
@@ -560,15 +560,18 @@ app.post('/rastrear-pedido', async (req, res) => {
 
         const freteInfo = JSON.parse(pedidoDoBanco.info_frete || '{}');
 
+        // 2. OBJETO DE RESPOSTA CORRIGIDO: Definindo as datas como 'null'
         const dadosFormatadosParaFrontend = {
             id: pedidoDoBanco.id,
             status: pedidoDoBanco.status,
             codigo_rastreio: pedidoDoBanco.codigo_rastreio,
-            data_pagamento: pedidoDoBanco.data_pagamento,
-            data_envio: pedidoDoBanco.data_envio,
-            data_entrega: pedidoDoBanco.data_entrega,
-            // data_producao não parece estar no seu DB, então não foi incluída
-            data_prevista_entrega: null, // Você pode adicionar lógica para calcular isso se quiser
+            
+            // Como não temos essas datas no banco, enviamos null para o frontend não quebrar
+            data_pagamento: null,
+            data_producao: null, // O frontend também espera esta data
+            data_envio: null,
+            data_entrega: null,
+            data_prevista_entrega: null,
             
             cliente: {
                 nome: pedidoDoBanco.nome_cliente,
@@ -585,8 +588,7 @@ app.post('/rastrear-pedido', async (req, res) => {
             itens: itensFormatados,
             
             pagamento: {
-                metodo: 'Cartão de Crédito ou PIX', // O ideal é salvar isso no momento da compra
-                final_cartao: null, // Você precisaria buscar essa info do Mercado Pago se necessário
+                metodo: 'Não informado',
             },
 
             frete: parseFloat(freteInfo.price || 0)
