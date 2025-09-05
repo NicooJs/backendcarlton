@@ -275,10 +275,18 @@ app.post('/notificacao-pagamento', async (req, res) => {
                         const novoStatus = payment.status === 'approved' ? 'PAGO' : 'PAGAMENTO_PENDENTE';
                         
                         if (pedidoDoBanco.status !== novoStatus) {
-                            await db.query("UPDATE pedidos SET status = ?, mercado_pago_id = ? WHERE id = ?", [novoStatus, payment.id, pedidoId]);
-                            console.log(`Status do Pedido #${pedidoId} atualizado para: ${novoStatus}`);
-                        }
+    // Pegamos os detalhes do pagamento que o Mercado Pago nos enviou
+    const metodoPagamento = payment.payment_method_id || 'Não identificado';
+    const finalCartao = payment.card ? payment.card.last_four_digits : null;
 
+    // Agora atualizamos o banco de dados com tudo
+    await db.query(
+        "UPDATE pedidos SET status = ?, mercado_pago_id = ?, metodo_pagamento = ?, final_cartao = ? WHERE id = ?",
+        [novoStatus, payment.id, metodoPagamento, finalCartao, pedidoId]
+    );
+
+    console.log(`Status do Pedido #${pedidoId} atualizado para: ${novoStatus}`);
+}
                         if (novoStatus === 'PAGO') {
                             await enviarEmailDeConfirmacao({ ...pedidoDoBanco, mercado_pago_id: payment.id });
                             await inserirPedidoNoCarrinhoME(pedidoDoBanco); // Só quando aprovado
