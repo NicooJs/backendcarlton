@@ -1,5 +1,5 @@
 /* ================================================================================
-|                                  Feito 100% por Nicolas Arantes                                  |
+|                                  Feito 100% por Nicolas Arantes                                   |
 ================================================================================ */
 
 import express from 'express';
@@ -274,14 +274,32 @@ app.post('/notificacao-pagamento', async (req, res) => {
                     } else {
                         const novoStatus = payment.status === 'approved' ? 'PAGO' : 'PAGAMENTO_PENDENTE';
                         
-                        if (pedidoDoBanco.status !== novoStatus) {
-                            await db.query("UPDATE pedidos SET status = ?, mercado_pago_id = ? WHERE id = ?", [novoStatus, payment.id, pedidoId]);
-                            console.log(`Status do Pedido #${pedidoId} atualizado para: ${novoStatus}`);
-                        }
-
+                        // ===== ALTERAÇÃO AQUI: Salvando os dados nas colunas específicas =====
                         if (novoStatus === 'PAGO') {
+                            const metodoPagamento = payment.payment_type_id === 'credit_card' ? 'Cartão de Crédito' :
+                                                    payment.payment_type_id === 'ticket' ? 'Boleto' :
+                                                    payment.payment_method_id === 'pix' ? 'PIX' :
+                                                    (payment.payment_method_id || 'Não especificado');
+                            
+                            const finalCartao = payment.card ? payment.card.last_four_digits : null;
+                            
+                            // Query SQL atualizada para usar as novas colunas
+                            const sql = `
+                                UPDATE pedidos 
+                                SET status = ?, mercado_pago_id = ?, metodo_pagamento = ?, final_cartao = ? 
+                                WHERE id = ?
+                            `;
+                            
+                            await db.query(sql, [novoStatus, payment.id, metodoPagamento, finalCartao, pedidoId]);
+                            console.log(`Status do Pedido #${pedidoId} atualizado para: ${novoStatus} com método de pagamento.`);
+                            
                             await enviarEmailDeConfirmacao({ ...pedidoDoBanco, mercado_pago_id: payment.id });
                             await inserirPedidoNoCarrinhoME(pedidoDoBanco); // Só quando aprovado
+
+                        } else if (pedidoDoBanco.status !== novoStatus) {
+                            // Se o status mudou mas ainda não foi pago, atualiza só o status
+                             await db.query("UPDATE pedidos SET status = ?, mercado_pago_id = ? WHERE id = ?", [novoStatus, payment.id, pedidoId]);
+                             console.log(`Status do Pedido #${pedidoId} atualizado para: ${novoStatus}`);
                         }
                     }
                 }
@@ -517,12 +535,13 @@ app.post('/rastrear-pedido', async (req, res) => {
     try {
         const cpfLimpo = cpf.replace(/\D/g, '');
 
+        // ===== ALTERAÇÃO AQUI: Adicionamos 'metodo_pagamento' e 'final_cartao' na consulta SQL =====
         const sql = `
             SELECT 
                 id, nome_cliente, status, codigo_rastreio, 
                 logradouro, bairro, cidade, estado, cep, numero, complemento,
                 itens_pedido, info_frete, valor_total,
-                data_criacao
+                data_criacao, metodo_pagamento, final_cartao
             FROM pedidos 
             WHERE cpf_cliente = ? AND email_cliente = ?
             ORDER BY data_criacao DESC 
@@ -579,8 +598,11 @@ app.post('/rastrear-pedido', async (req, res) => {
             
             itens: itensFormatados,
             
+            // ===== ALTERAÇÃO AQUI: Enviamos os dados de pagamento lidos do banco =====
             pagamento: {
-                metodo: 'Não informado',
+                metodo: pedidoDoBanco.metodo_pagamento || 'Não informado',
+                // Formatamos o final do cartão para uma melhor exibição no frontend
+                final_cartao: pedidoDoBanco.final_cartao ? `**** **** **** ${pedidoDoBanco.final_cartao}` : null,
             },
 
             frete: parseFloat(freteInfo.price || 0)
