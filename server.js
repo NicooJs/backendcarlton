@@ -518,9 +518,7 @@ async function inserirPedidoNoCarrinhoME(pedido) {
 // ROTA PARA O CLIENTE RASTREAR O PEDIDO (VERSÃO CORRETA E LIMPA)
 // ROTA PARA O CLIENTE RASTREAR O PEDIDO (VERSÃO MELHORADA HÍBRIDA)
 app.post('/rastrear-pedido', async (req, res) => {
-    console.log("LOG: Recebida solicitação para rastrear pedido por CPF:", req.body);
-    
-    // Agora esperamos 'cpf' e 'email' no corpo da requisição
+    console.log("LOG: Recebida solicitação para rastrear pedido:", req.body);
     const { cpf, email } = req.body;
 
     if (!cpf || !email) {
@@ -528,13 +526,15 @@ app.post('/rastrear-pedido', async (req, res) => {
     }
 
     try {
-        // Limpamos o CPF para remover pontos e traços, garantindo a busca correta
         const cpfLimpo = cpf.replace(/\D/g, '');
 
-        // A query agora busca na coluna 'cpf_cliente'
-        // Adicionamos "ORDER BY data_criacao DESC LIMIT 1" para pegar o pedido mais recente
+        // 1. QUERY MODIFICADA: Buscando todos os campos necessários
         const sql = `
-            SELECT id, status, codigo_rastreio, data_criacao 
+            SELECT 
+                id, nome_cliente, status, codigo_rastreio, 
+                logradouro, bairro, cidade, estado, cep, numero, complemento,
+                itens_pedido, info_frete, valor_total,
+                data_criacao, data_pagamento, data_envio, data_entrega 
             FROM pedidos 
             WHERE cpf_cliente = ? AND email_cliente = ?
             ORDER BY data_criacao DESC 
@@ -547,8 +547,53 @@ app.post('/rastrear-pedido', async (req, res) => {
             return res.status(404).json({ error: 'Nenhum pedido encontrado para o CPF e e-mail informados.' });
         }
         
-        // Retorna os dados do pedido mais recente encontrado
-        res.status(200).json(rows[0]);
+        const pedidoDoBanco = rows[0];
+
+        // 2. TRANSFORMAÇÃO DOS DADOS: Formatando para o que o frontend espera
+        const itensFormatados = JSON.parse(pedidoDoBanco.itens_pedido || '[]').map(item => ({
+            id: item.id,
+            nome: item.title, // Mapeando 'title' para 'nome'
+            quantidade: item.quantity,
+            preco: parseFloat(item.unit_price),
+            imagemUrl: item.picture_url
+        }));
+
+        const freteInfo = JSON.parse(pedidoDoBanco.info_frete || '{}');
+
+        const dadosFormatadosParaFrontend = {
+            id: pedidoDoBanco.id,
+            status: pedidoDoBanco.status,
+            codigo_rastreio: pedidoDoBanco.codigo_rastreio,
+            data_pagamento: pedidoDoBanco.data_pagamento,
+            data_envio: pedidoDoBanco.data_envio,
+            data_entrega: pedidoDoBanco.data_entrega,
+            // data_producao não parece estar no seu DB, então não foi incluída
+            data_prevista_entrega: null, // Você pode adicionar lógica para calcular isso se quiser
+            
+            cliente: {
+                nome: pedidoDoBanco.nome_cliente,
+            },
+            
+            endereco_entrega: {
+                rua: `${pedidoDoBanco.logradouro}, ${pedidoDoBanco.numero}`,
+                bairro: pedidoDoBanco.bairro,
+                cidade: pedidoDoBanco.cidade,
+                estado: pedidoDoBanco.estado,
+                cep: pedidoDoBanco.cep,
+            },
+            
+            itens: itensFormatados,
+            
+            pagamento: {
+                metodo: 'Cartão de Crédito ou PIX', // O ideal é salvar isso no momento da compra
+                final_cartao: null, // Você precisaria buscar essa info do Mercado Pago se necessário
+            },
+
+            frete: parseFloat(freteInfo.price || 0)
+        };
+        
+        console.log('Dados enviados para o frontend:', JSON.stringify(dadosFormatadosParaFrontend, null, 2));
+        res.status(200).json(dadosFormatadosParaFrontend);
 
     } catch (error) {
         console.error("ERRO AO BUSCAR PEDIDO PELO CPF:", error);
