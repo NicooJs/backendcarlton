@@ -73,8 +73,9 @@ app.post('/criar-preferencia', async (req, res) => {
 
         // Expiração de 5 minutos para pagamento PIX
         // Expiração de 5 minutos para pagamento PIX
+// Expiração de 1 hora para o Checkout Pro
 const now = new Date();
-const expiresAt = new Date(now.getTime() + 5 * 60 * 1000).toISOString();
+const expiresAt = new Date(now.getTime() + 60 * 60 * 1000).toISOString(); // +1 hora
 
 const preferenceBody = {
     items,
@@ -88,9 +89,10 @@ const preferenceBody = {
         pending: `${FRONTEND_URL}/pendente`
     },
     expires: true,
-    expiration_date_from: now.toISOString(),  // início da validade
-    expiration_date_to: expiresAt             // expira em 5 minutos
+    expiration_date_from: now.toISOString(),
+    expiration_date_to: expiresAt
 };
+
 
         const preference = new Preference(client);
         const preferenceResult = await preference.create({ body: preferenceBody });
