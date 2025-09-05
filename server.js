@@ -1,5 +1,5 @@
 /* ================================================================================ 
-|   ARQUIVO DO SERVIDOR BACKEND - VERSÃO FINAL E CORRIGIDA                        | 
+|                     Feito 100% por Nicolas Arantes                  | 
 ================================================================================ */
 
 import express from 'express';
@@ -41,7 +41,6 @@ const transporter = nodemailer.createTransport({
     auth: { user: EMAIL_USER, pass: EMAIL_PASS },
 });
 
-
 // ------------------- ROTAS DA APLICAÇÃO -------------------
 
 // ROTA /criar-preferencia
@@ -72,6 +71,10 @@ app.post('/criar-preferencia', async (req, res) => {
         ]);
         const novoPedidoId = result.insertId;
 
+        // Expiração de 5 minutos para pagamento PIX
+        const now = new Date();
+        const expiresAt = new Date(now.getTime() + 5 * 60 * 1000).toISOString();
+
         const preferenceBody = {
             items,
             payer: { first_name: customerInfo.firstName, email: customerInfo.email },
@@ -82,7 +85,9 @@ app.post('/criar-preferencia', async (req, res) => {
                 success: `${FRONTEND_URL}/sucesso`,
                 failure: `${FRONTEND_URL}/falha`,
                 pending: `${FRONTEND_URL}/pendente`
-            }
+            },
+            expires: true,
+            expiration_date_to: expiresAt
         };
 
         const preference = new Preference(client);
@@ -116,7 +121,7 @@ app.post('/calcular-frete', async (req, res) => {
                 const viaCepResponse = await fetch(viaCepUrl);
                 addressInfo = await viaCepResponse.json();
                 if (addressInfo.erro) throw new Error("CEP de destino não encontrado.");
-                break; // Sai do loop se a requisição for bem-sucedida
+                break;
             } catch (error) {
                 attempts++;
                 if (attempts === maxAttempts) {
@@ -124,7 +129,7 @@ app.post('/calcular-frete', async (req, res) => {
                     throw new Error('Não foi possível conectar com o serviço de CEP no momento. Por favor, tente novamente mais tarde.');
                 }
                 console.warn(`Tentativa ${attempts} de conectar com ViaCEP falhou. Tentando novamente...`);
-                await new Promise(resolve => setTimeout(resolve, 1000 * attempts)); // Espera antes de tentar novamente
+                await new Promise(resolve => setTimeout(resolve, 1000 * attempts));
             }
         }
 
@@ -224,12 +229,7 @@ app.post('/notificacao-pagamento', async (req, res) => {
 
                         if (novoStatus === 'PAGO') {
                             await enviarEmailDeConfirmacao({ ...pedidoDoBanco, mercado_pago_id: payment.id });
-                        }
-                        
-                        if (!pedidoDoBanco.melhor_envio_id) {
-                            await inserirPedidoNoCarrinhoME(pedidoDoBanco);
-                        } else {
-                            console.log(`Etiqueta Melhor Envio para o pedido #${pedidoId} já foi gerada.`);
+                            await inserirPedidoNoCarrinhoME(pedidoDoBanco); // Só quando aprovado
                         }
                     }
                 }
@@ -244,6 +244,27 @@ app.post('/notificacao-pagamento', async (req, res) => {
     res.status(200).send('Notificação recebida');
 });
 
+// ROTA DE WEBHOOK DO MELHOR ENVIO PARA RASTREIO
+app.post('/webhook-melhorenvio', async (req, res) => {
+    console.log("LOG: Notificação do Melhor Envio recebida:", req.body);
+    try {
+        const { resource, event } = req.body;
+
+        if (event === "tracking") {
+            const { id, tracking } = resource;
+            const [rows] = await db.query("SELECT * FROM pedidos WHERE melhor_envio_id = ?", [id]);
+            if (rows.length > 0 && tracking) {
+                const pedido = rows[0];
+                await db.query("UPDATE pedidos SET codigo_rastreio = ? WHERE id = ?", [tracking, pedido.id]);
+                await enviarEmailComRastreio(pedido, tracking);
+            }
+        }
+        res.status(200).send("Webhook do Melhor Envio processado com sucesso");
+    } catch (error) {
+        console.error("ERRO AO PROCESSAR WEBHOOK DO MELHOR ENVIO:", error);
+        res.status(500).send("Erro no processamento do webhook");
+    }
+});
 
 // --- FUNÇÃO AUXILIAR DE ENVIO DE E-MAIL ---
 async function enviarEmailDeConfirmacao(pedido) {
@@ -254,12 +275,6 @@ async function enviarEmailDeConfirmacao(pedido) {
         <h1>🎉 Pedido Confirmado! (Nº ${pedido.id})</h1>
         <p>Olá, ${pedido.nome_cliente}. Seu pagamento foi aprovado!</p>
         <p><strong>ID do Pagamento (Mercado Pago):</strong> ${pedido.mercado_pago_id}</p>
-        <hr>
-        <h2>Dados do Cliente</h2>
-        <p><strong>Nome:</strong> ${pedido.nome_cliente}</p>
-        <p><strong>E-mail:</strong> ${pedido.email_cliente}</p>
-        <p><strong>CPF:</strong> ${pedido.cpf_cliente}</p>
-        <p><strong>Telefone:</strong> ${pedido.telefone_cliente}</p>
         <hr>
         <h2>Endereço de Entrega</h2>
         <p>${pedido.endereco_entrega}</p>
@@ -288,6 +303,28 @@ async function enviarEmailDeConfirmacao(pedido) {
     }
 }
 
+// --- FUNÇÃO: ENVIAR E-MAIL COM RASTREIO ---
+async function enviarEmailComRastreio(pedido, trackingCode) {
+    const emailBody = `
+        <h1>📦 Seu pedido foi postado!</h1>
+        <p>Olá, ${pedido.nome_cliente}.</p>
+        <p>Seu pedido <strong>#${pedido.id}</strong> já foi enviado.</p>
+        <p><strong>Código de rastreio:</strong> ${trackingCode}</p>
+        <p>Acompanhe pelo site dos Correios ou Melhor Envio.</p>
+    `;
+
+    try {
+        await transporter.sendMail({
+            from: `"Sua Loja" <${EMAIL_USER}>`,
+            to: pedido.email_cliente,
+            subject: `Código de Rastreio - Pedido #${pedido.id}`,
+            html: emailBody,
+        });
+        console.log(`E-mail de rastreio enviado para o pedido #${pedido.id}.`);
+    } catch (error) {
+        console.error(`Erro ao enviar e-mail de rastreio para o pedido #${pedido.id}:`, error);
+    }
+}
 
 // --- FUNÇÃO: INSERIR PEDIDO NO CARRINHO DO MELHOR ENVIO ---
 async function inserirPedidoNoCarrinhoME(pedido) {
@@ -353,17 +390,13 @@ async function inserirPedidoNoCarrinhoME(pedido) {
     if (!response.ok) {
         console.error("Payload enviado para o Melhor Envio:", JSON.stringify(payload, null, 2));
         console.error("Resposta de erro do Melhor Envio:", data);
-        throw new Error(JSON.stringify(data.error || 'Erro ao adicionar etiqueta ao carrinho do Melhor Envio.'));
+        throw new Error(JSON.stringify(data.error || 'Erro ao inserir no carrinho Melhor Envio.'));
     }
 
-    const melhorEnvioId = data.id;
-    console.log(`SUCESSO! Pedido #${pedido.id} inserido no carrinho Melhor Envio com ID: ${melhorEnvioId}`);
-
-    await db.query("UPDATE pedidos SET melhor_envio_id = ? WHERE id = ?", [melhorEnvioId, pedido.id]);
-    console.log(`ID do Melhor Envio salvo no banco para o pedido #${pedido.id}.`);
+    console.log(`Pedido #${pedido.id} inserido no carrinho do Melhor Envio com sucesso.`);
 }
 
-// --- INICIALIZAÇÃO DO SERVIDOR ---
+// --- INICIAR SERVIDOR ---
 app.listen(port, () => {
-    console.log(`Servidor backend rodando na porta ${port}`);
+    console.log(`🚀 Servidor rodando em http://localhost:${port}`);
 });
