@@ -517,21 +517,6 @@ async function inserirPedidoNoCarrinhoME(pedido) {
 // ROTA PARA O CLIENTE RASTREAR O PEDIDO
 // ROTA PARA O CLIENTE RASTREAR O PEDIDO (VERSÃO CORRETA E LIMPA)
 // ROTA PARA O CLIENTE RASTREAR O PEDIDO (VERSÃO MELHORADA HÍBRIDA)
-Este novo erro, SyntaxError: Unexpected token o in JSON at position 1, é um clássico! Ele acontece quando você tenta usar JSON.parse() em algo que já é um objeto JavaScript, e não um texto (string) em formato JSON.
-
-A causa provável é que seu driver do banco de dados (provavelmente o mysql2) está configurado para converter automaticamente colunas do tipo JSON para objetos JavaScript. Quando seu código recebe pedidoDoBanco.itens_pedido, ele não é mais um texto como "[...]", mas sim um objeto real [...]. Ao tentar fazer JSON.parse nesse objeto, ele falha.
-
-A correção é simples: só devemos usar JSON.parse() se o dado for uma string.
-
-✅ Correção Final
-Substitua a sua rota /rastrear-pedido por esta versão. Ela verifica o tipo do dado antes de tentar fazer o parse, resolvendo o erro de vez.
-
-Arquivo: server.js
-
-JavaScript
-
-// VERSÃO FINAL CORRIGIDA QUE EVITA O ERRO DE JSON.PARSE
-
 app.post('/rastrear-pedido', async (req, res) => {
     console.log("LOG: Recebida solicitação para rastrear pedido:", req.body);
     const { cpf, email } = req.body;
@@ -543,6 +528,7 @@ app.post('/rastrear-pedido', async (req, res) => {
     try {
         const cpfLimpo = cpf.replace(/\D/g, '');
 
+        // 1. QUERY CORRIGIDA: Removendo as colunas de data que não existem na sua tabela
         const sql = `
             SELECT 
                 id, nome_cliente, status, codigo_rastreio, 
@@ -562,16 +548,9 @@ app.post('/rastrear-pedido', async (req, res) => {
         }
         
         const pedidoDoBanco = rows[0];
-        
-        const itens = typeof pedidoDoBanco.itens_pedido === 'string' 
-            ? JSON.parse(pedidoDoBanco.itens_pedido) 
-            : pedidoDoBanco.itens_pedido || [];
 
-        const freteInfo = typeof pedidoDoBanco.info_frete === 'string'
-            ? JSON.parse(pedidoDoBanco.info_frete)
-            : pedidoDoBanco.info_frete || {};
-        
-        const itensFormatados = itens.map(item => ({
+        // TRANSFORMAÇÃO DOS DADOS...
+        const itensFormatados = JSON.parse(pedidoDoBanco.itens_pedido || '[]').map(item => ({
             id: item.id,
             nome: item.title,
             quantidade: item.quantity,
@@ -579,12 +558,17 @@ app.post('/rastrear-pedido', async (req, res) => {
             imagemUrl: item.picture_url
         }));
 
+        const freteInfo = JSON.parse(pedidoDoBanco.info_frete || '{}');
+
+        // 2. OBJETO DE RESPOSTA CORRIGIDO: Definindo as datas como 'null'
         const dadosFormatadosParaFrontend = {
             id: pedidoDoBanco.id,
             status: pedidoDoBanco.status,
             codigo_rastreio: pedidoDoBanco.codigo_rastreio,
+            
+            // Como não temos essas datas no banco, enviamos null para o frontend não quebrar
             data_pagamento: null,
-            data_producao: null,
+            data_producao: null, // O frontend também espera esta data
             data_envio: null,
             data_entrega: null,
             data_prevista_entrega: null,
