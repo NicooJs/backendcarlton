@@ -496,7 +496,35 @@ async function inserirPedidoNoCarrinhoME(pedido) {
 
     console.log(`Pedido #${pedido.id} inserido no carrinho do Melhor Envio com sucesso.`);
 }
+// ROTA PARA O CLIENTE RASTREAR O PEDIDO
+app.post('/rastrear-pedido', async (req, res) => {
+    console.log("LOG: Recebida solicitação para rastrear pedido:", req.body);
+    const { pedidoId, email } = req.body;
 
+    if (!pedidoId || !email) {
+        return res.status(400).json({ error: 'Número do pedido e e-mail são obrigatórios.' });
+    }
+
+    try {
+        const sql = `
+            SELECT id, status, codigo_rastreio, data_criacao 
+            FROM pedidos 
+            WHERE id = ? AND email_cliente = ?
+        `;
+        const [rows] = await db.query(sql, [pedidoId, email]);
+
+        if (rows.length === 0) {
+            return res.status(404).json({ error: 'Pedido não encontrado ou e-mail incorreto. Verifique os dados e tente novamente.' });
+        }
+        
+        // Retornamos apenas os dados seguros para o cliente
+        res.status(200).json(rows[0]);
+
+    } catch (error) {
+        console.error("ERRO AO BUSCAR PEDIDO:", error);
+        res.status(500).json({ error: 'Ocorreu um erro interno. Por favor, tente mais tarde.' });
+    }
+});
 // --- INICIAR SERVIDOR ---
 app.listen(port, () => {
     console.log(`🚀 Servidor rodando em http://localhost:${port}`);
