@@ -1,5 +1,5 @@
 /* ================================================================================
-|                                  Feito 100% por Nicolas Arantes                                   |
+|                                  Feito 100% por Nicolas Arantes                                   |
 ================================================================================ */
 
 import express from 'express';
@@ -40,7 +40,6 @@ if (!MP_ACCESS_TOKEN || !MELHOR_ENVIO_TOKEN || !BACKEND_URL || !FRONTEND_URL || 
     process.exit(1);
 }
 
-// **NOVA LÓGICA DE VALIDAÇÃO: agora apenas avisa se a chave estiver faltando.**
 if (!MP_WEBHOOK_SECRET) {
     console.warn("AVISO: Variável de ambiente MP_WEBHOOK_SECRET não encontrada. A validação de segurança dos webhooks do Mercado Pago está desativada.");
 }
@@ -74,7 +73,6 @@ app.post('/criar-preferencia', async (req, res) => {
             itens_pedido, info_frete, valor_total, status, expiracao_pix
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'AGUARDANDO_PAGAMENTO', ?);`;
 
-        // Define a expiração em 30 minutos para o PIX, para uso interno
         const expiracaoPix = new Date(Date.now() + 30 * 60 * 1000);
 
         const [result] = await db.query(sql, [
@@ -87,9 +85,8 @@ app.post('/criar-preferencia', async (req, res) => {
         ]);
         const novoPedidoId = result.insertId;
 
-        // Expiração de 1 hora para o Checkout Pro
         const now = new Date();
-        const expiresAt = new Date(now.getTime() + 60 * 60 * 1000).toISOString(); // +1 hora
+        const expiresAt = new Date(now.getTime() + 60 * 60 * 1000).toISOString();
 
         const preferenceBody = {
             items,
@@ -106,7 +103,6 @@ app.post('/criar-preferencia', async (req, res) => {
             expiration_date_from: now.toISOString(),
             expiration_date_to: expiresAt
         };
-
 
         const preference = new Preference(client);
         const preferenceResult = await preference.create({ body: preferenceBody });
@@ -220,7 +216,6 @@ app.post('/calcular-frete', async (req, res) => {
 
 // ROTA DE WEBHOOK PARA NOTIFICAÇÕES DO MERCADO PAGO
 app.post('/notificacao-pagamento', async (req, res) => {
-    // A validação só é feita se a chave estiver configurada
     if (MP_WEBHOOK_SECRET) {
         const signature = req.headers['x-signature'];
         if (!signature) {
@@ -253,7 +248,6 @@ app.post('/notificacao-pagamento', async (req, res) => {
         console.warn("AVISO: Validação de segurança do webhook desativada. Adicione MP_WEBHOOK_SECRET no seu .env para ativar a proteção.");
     }
     
-    // O restante da lógica de processamento continua aqui
     console.log('LOG: Notificação recebida:', req.query);
     const topic = req.query.topic || req.query.type;
 
@@ -269,13 +263,16 @@ app.post('/notificacao-pagamento', async (req, res) => {
                 if (rows.length > 0) {
                     const pedidoDoBanco = rows[0];
 
-                    if (pedidoDoBanco.status === 'PAGO') {
-                        console.log(`Pedido ${pedidoId} já está PAGO. Nenhuma ação necessária.`);
+                    // Evita processar novamente um pedido já pago ou em produção
+                    if (pedidoDoBanco.status !== 'AGUARDANDO_PAGAMENTO' && pedidoDoBanco.status !== 'PAGAMENTO_PENDENTE') {
+                        console.log(`Pedido ${pedidoId} já processado (status: ${pedidoDoBanco.status}). Nenhuma ação necessária.`);
                     } else {
-                        const novoStatus = payment.status === 'approved' ? 'PAGO' : 'PAGAMENTO_PENDENTE';
+                        const isApproved = payment.status === 'approved';
                         
-                        // ===== ALTERAÇÃO AQUI: Salvando os dados nas colunas específicas =====
-                        if (novoStatus === 'PAGO') {
+                        // ===== ALTERAÇÃO #1: Define o status para EM_PRODUCAO se aprovado =====
+                        const novoStatus = isApproved ? 'EM_PRODUCAO' : 'PAGAMENTO_PENDENTE';
+                        
+                        if (isApproved) {
                             const metodoPagamento = payment.payment_type_id === 'credit_card' ? 'Cartão de Crédito' :
                                                     payment.payment_type_id === 'ticket' ? 'Boleto' :
                                                     payment.payment_method_id === 'pix' ? 'PIX' :
@@ -283,7 +280,6 @@ app.post('/notificacao-pagamento', async (req, res) => {
                             
                             const finalCartao = payment.card ? payment.card.last_four_digits : null;
                             
-                            // Query SQL atualizada para usar as novas colunas
                             const sql = `
                                 UPDATE pedidos 
                                 SET status = ?, mercado_pago_id = ?, metodo_pagamento = ?, final_cartao = ? 
@@ -294,12 +290,11 @@ app.post('/notificacao-pagamento', async (req, res) => {
                             console.log(`Status do Pedido #${pedidoId} atualizado para: ${novoStatus} com método de pagamento.`);
                             
                             await enviarEmailDeConfirmacao({ ...pedidoDoBanco, mercado_pago_id: payment.id });
-                            await inserirPedidoNoCarrinhoME(pedidoDoBanco); // Só quando aprovado
+                            await inserirPedidoNoCarrinhoME(pedidoDoBanco);
 
                         } else if (pedidoDoBanco.status !== novoStatus) {
-                            // Se o status mudou mas ainda não foi pago, atualiza só o status
-                             await db.query("UPDATE pedidos SET status = ?, mercado_pago_id = ? WHERE id = ?", [novoStatus, payment.id, pedidoId]);
-                             console.log(`Status do Pedido #${pedidoId} atualizado para: ${novoStatus}`);
+                            await db.query("UPDATE pedidos SET status = ?, mercado_pago_id = ? WHERE id = ?", [novoStatus, payment.id, pedidoId]);
+                            console.log(`Status do Pedido #${pedidoId} atualizado para: ${novoStatus}`);
                         }
                     }
                 }
@@ -323,9 +318,15 @@ app.post('/webhook-melhorenvio', async (req, res) => {
         if (event === "tracking") {
             const { id, tracking } = resource;
             const [rows] = await db.query("SELECT * FROM pedidos WHERE melhor_envio_id = ?", [id]);
+            
             if (rows.length > 0 && tracking) {
                 const pedido = rows[0];
-                await db.query("UPDATE pedidos SET codigo_rastreio = ? WHERE id = ?", [tracking, pedido.id]);
+                
+                // ===== ALTERAÇÃO #2: Atualiza o código de rastreio E o status para ENVIADO =====
+                const sql = "UPDATE pedidos SET codigo_rastreio = ?, status = 'ENVIADO' WHERE id = ?";
+                await db.query(sql, [tracking, pedido.id]);
+                
+                console.log(`Pedido #${pedido.id} atualizado para ENVIADO com rastreio ${tracking}.`);
                 await enviarEmailComRastreio(pedido, tracking);
             }
         }
@@ -535,7 +536,6 @@ app.post('/rastrear-pedido', async (req, res) => {
     try {
         const cpfLimpo = cpf.replace(/\D/g, '');
 
-        // ===== ALTERAÇÃO AQUI: Adicionamos 'metodo_pagamento' e 'final_cartao' na consulta SQL =====
         const sql = `
             SELECT 
                 id, nome_cliente, status, codigo_rastreio, 
@@ -564,21 +564,19 @@ app.post('/rastrear-pedido', async (req, res) => {
             ? JSON.parse(pedidoDoBanco.info_frete)
             : pedidoDoBanco.info_frete || {};
         
-        // ======================= ALTERAÇÃO FEITA AQUI =======================
         const itensFormatados = itens.map(item => ({
             id: item.id,
             nome: item.title,
             quantidade: item.quantity,
             preco: parseFloat(item.unit_price),
-            imagem: item.picture_url // ALTERADO de 'imagemUrl' para 'imagem'
+            imagem: item.picture_url
         }));
-        // ====================================================================
 
         const dadosFormatadosParaFrontend = {
             id: pedidoDoBanco.id,
             status: pedidoDoBanco.status,
             codigo_rastreio: pedidoDoBanco.codigo_rastreio,
-            data_pagamento: null,
+            data_pagamento: null, // Lógica para datas pode ser adicionada no futuro
             data_producao: null,
             data_envio: null,
             data_entrega: null,
@@ -598,10 +596,8 @@ app.post('/rastrear-pedido', async (req, res) => {
             
             itens: itensFormatados,
             
-            // ===== ALTERAÇÃO AQUI: Enviamos os dados de pagamento lidos do banco =====
             pagamento: {
                 metodo: pedidoDoBanco.metodo_pagamento || 'Não informado',
-                // Formatamos o final do cartão para uma melhor exibição no frontend
                 final_cartao: pedidoDoBanco.final_cartao ? `**** **** **** ${pedidoDoBanco.final_cartao}` : null,
             },
 
