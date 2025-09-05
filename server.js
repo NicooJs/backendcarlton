@@ -1,5 +1,5 @@
 /* ================================================================================
-|                                 Feito 100% por Nicolas Arantes                                 |
+|                                  Feito 100% por Nicolas Arantes                                  |
 ================================================================================ */
 
 import express from 'express';
@@ -318,12 +318,7 @@ app.post('/webhook-melhorenvio', async (req, res) => {
     }
 });
 
-// --- ALTERAÇÃO INSERIDA ---
 // ROTA PARA CHECAR PEDIDOS EXPIRADOS
-// ATENÇÃO: Esta é uma rota de acionamento manual.
-// Para uma solução automatizada e robusta, configure um Cron Job 
-// na sua plataforma de hospedagem (Railway, etc.) para chamar esta URL
-// a cada 5 ou 10 minutos.
 app.get('/checar-pedidos-expirados', async (req, res) => {
     console.log("LOG: Iniciando checagem de pedidos expirados.");
     try {
@@ -333,7 +328,6 @@ app.get('/checar-pedidos-expirados', async (req, res) => {
         
         for (const pedido of pedidosExpirados) {
             await db.query("UPDATE pedidos SET status = 'CANCELADO_POR_EXPIRACAO' WHERE id = ?", [pedido.id]);
-            // 2. E-mail de Expiração
             await enviarEmailDeExpiracao(pedido);
             console.log(`Pedido #${pedido.id} cancelado por expiração e e-mail enviado.`);
         }
@@ -345,7 +339,7 @@ app.get('/checar-pedidos-expirados', async (req, res) => {
     }
 });
 
-// --- FUNÇÃO AUXILIAR DE ENVIO DE E-MAIL ---
+// FUNÇÃO AUXILIAR DE ENVIO DE E-MAIL
 async function enviarEmailDeConfirmacao(pedido) {
     const itens = typeof pedido.itens_pedido === 'string' ? JSON.parse(pedido.itens_pedido) : pedido.itens_pedido;
     const frete = typeof pedido.info_frete === 'string' ? JSON.parse(pedido.info_frete) : pedido.info_frete;
@@ -382,7 +376,7 @@ async function enviarEmailDeConfirmacao(pedido) {
     }
 }
 
-// --- FUNÇÃO: ENVIAR E-MAIL COM RASTREIO ---
+// FUNÇÃO: ENVIAR E-MAIL COM RASTREIO
 async function enviarEmailComRastreio(pedido, trackingCode) {
     const emailBody = `
         <h1>📦 Seu pedido foi postado!</h1>
@@ -405,7 +399,7 @@ async function enviarEmailComRastreio(pedido, trackingCode) {
     }
 }
 
-// --- FUNÇÃO: ENVIAR E-MAIL DE EXPIRAÇÃO DE PIX ---
+// FUNÇÃO: ENVIAR E-MAIL DE EXPIRAÇÃO DE PIX
 async function enviarEmailDeExpiracao(pedido) {
     const emailBody = `
         <h1>⚠️ Pagamento não confirmado para o Pedido #${pedido.id}</h1>
@@ -432,7 +426,7 @@ async function enviarEmailDeExpiracao(pedido) {
     }
 }
 
-// --- FUNÇÃO: INSERIR PEDIDO NO CARRINHO DO MELHOR ENVIO ---
+// FUNÇÃO: INSERIR PEDIDO NO CARRINHO DO MELHOR ENVIO
 async function inserirPedidoNoCarrinhoME(pedido) {
     console.log(`Iniciando inserção no carrinho Melhor Envio para o pedido #${pedido.id}`);
     
@@ -499,9 +493,6 @@ async function inserirPedidoNoCarrinhoME(pedido) {
         throw new Error(JSON.stringify(data.error || 'Erro ao inserir no carrinho Melhor Envio.'));
     }
     
-    // --- ALTERAÇÃO INSERIDA ---
-    // Pega o ID retornado pelo Melhor Envio e salva no nosso banco de dados.
-    // Isso é ESSENCIAL para que o webhook de rastreio funcione.
     const melhorEnvioId = data.id;
     if (melhorEnvioId) {
         await db.query(
@@ -510,13 +501,11 @@ async function inserirPedidoNoCarrinhoME(pedido) {
         );
         console.log(`ID do Melhor Envio (${melhorEnvioId}) salvo para o pedido #${pedido.id}.`);
     }
-    // --- FIM DA ALTERAÇÃO ---
 
     console.log(`Pedido #${pedido.id} inserido no carrinho do Melhor Envio com sucesso.`);
 }
+
 // ROTA PARA O CLIENTE RASTREAR O PEDIDO
-// ROTA PARA O CLIENTE RASTREAR O PEDIDO (VERSÃO CORRETA E LIMPA)
-// ROTA PARA O CLIENTE RASTREAR O PEDIDO (VERSÃO MELHORADA HÍBRIDA)
 app.post('/rastrear-pedido', async (req, res) => {
     console.log("LOG: Recebida solicitação para rastrear pedido:", req.body);
     const { cpf, email } = req.body;
@@ -556,13 +545,15 @@ app.post('/rastrear-pedido', async (req, res) => {
             ? JSON.parse(pedidoDoBanco.info_frete)
             : pedidoDoBanco.info_frete || {};
         
+        // ======================= ALTERAÇÃO FEITA AQUI =======================
         const itensFormatados = itens.map(item => ({
             id: item.id,
             nome: item.title,
             quantidade: item.quantity,
             preco: parseFloat(item.unit_price),
-            imagemUrl: item.picture_url
+            imagem: item.picture_url // ALTERADO de 'imagemUrl' para 'imagem'
         }));
+        // ====================================================================
 
         const dadosFormatadosParaFrontend = {
             id: pedidoDoBanco.id,
@@ -603,6 +594,7 @@ app.post('/rastrear-pedido', async (req, res) => {
         res.status(500).json({ error: 'Ocorreu um erro interno. Por favor, tente mais tarde.' });
     }
 });
+
 // --- INICIAR SERVIDOR ---
 app.listen(port, () => {
     console.log(`🚀 Servidor rodando em http://localhost:${port}`);
