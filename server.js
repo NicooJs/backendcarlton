@@ -35,9 +35,14 @@ const {
 } = process.env;
 
 // Validação das variáveis de ambiente
-if (!MP_ACCESS_TOKEN || !MELHOR_ENVIO_TOKEN || !BACKEND_URL || !FRONTEND_URL || !EMAIL_USER || !db || !MP_WEBHOOK_SECRET) {
-    console.error("ERRO CRÍTICO: Verifique todas as variáveis de ambiente e a conexão com o banco de dados.");
+if (!MP_ACCESS_TOKEN || !MELHOR_ENVIO_TOKEN || !BACKEND_URL || !FRONTEND_URL || !EMAIL_USER || !db) {
+    console.error("ERRO CRÍTICO: Verifique as variáveis de ambiente essenciais.");
     process.exit(1);
+}
+
+// **NOVA LÓGICA DE VALIDAÇÃO: agora apenas avisa se a chave estiver faltando.**
+if (!MP_WEBHOOK_SECRET) {
+    console.warn("AVISO: Variável de ambiente MP_WEBHOOK_SECRET não encontrada. A validação de segurança dos webhooks do Mercado Pago está desativada.");
 }
 
 // --- CONFIGURAÇÃO DOS SERVIÇOS ---
@@ -215,22 +220,40 @@ app.post('/calcular-frete', async (req, res) => {
 
 // ROTA DE WEBHOOK PARA NOTIFICAÇÕES DO MERCADO PAGO
 app.post('/notificacao-pagamento', async (req, res) => {
-    // 3. Validação de Webhooks
-    const signature = req.headers['x-signature'];
-    const parts = signature.split(',');
-    const timestamp = parts.find(p => p.startsWith('ts=')).replace('ts=', '');
-    const signatureHash = parts.find(p => p.startsWith('v1=')).replace('v1=', '');
+    // A validação só é feita se a chave estiver configurada
+    if (MP_WEBHOOK_SECRET) {
+        const signature = req.headers['x-signature'];
+        if (!signature) {
+            console.error("ERRO DE SEGURANÇA: Assinatura do webhook ausente.");
+            return res.status(401).send('Invalid signature');
+        }
 
-    const message = `id:${req.query.id};ts:${timestamp};`;
-    const hmac = crypto.createHmac('sha256', MP_WEBHOOK_SECRET);
-    hmac.update(message);
-    const expectedSignature = hmac.digest('hex');
+        const parts = signature.split(',');
+        const timestampPart = parts.find(p => p.startsWith('ts='));
+        const signatureHashPart = parts.find(p => p.startsWith('v1='));
+        
+        if (!timestampPart || !signatureHashPart) {
+            console.error("ERRO DE SEGURANÇA: Formato de assinatura do webhook inválido.");
+            return res.status(401).send('Invalid signature format');
+        }
+        
+        const timestamp = timestampPart.replace('ts=', '');
+        const signatureHash = signatureHashPart.replace('v1=', '');
 
-    if (expectedSignature !== signatureHash) {
-        console.error("ERRO DE SEGURANÇA: Assinatura do webhook inválida. Possível fraude.");
-        return res.status(401).send('Invalid signature');
+        const message = `id:${req.query.id};ts:${timestamp};`;
+        const hmac = crypto.createHmac('sha256', MP_WEBHOOK_SECRET);
+        hmac.update(message);
+        const expectedSignature = hmac.digest('hex');
+
+        if (expectedSignature !== signatureHash) {
+            console.error("ERRO DE SEGURANÇA: Assinatura do webhook inválida. Possível fraude.");
+            return res.status(401).send('Invalid signature');
+        }
+    } else {
+        console.warn("AVISO: Validação de segurança do webhook desativada. Adicione MP_WEBHOOK_SECRET no seu .env para ativar a proteção.");
     }
-
+    
+    // O restante da lógica de processamento continua aqui
     console.log('LOG: Notificação recebida:', req.query);
     const topic = req.query.topic || req.query.type;
 
