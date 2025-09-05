@@ -562,8 +562,7 @@ app.post('/rastrear-pedido', async (req, res) => {
         }
         
         const pedidoDoBanco = rows[0];
-
-        // 1. VERIFICAÇÃO ADICIONADA: Só faz o parse se for uma string.
+        
         const itens = typeof pedidoDoBanco.itens_pedido === 'string' 
             ? JSON.parse(pedidoDoBanco.itens_pedido) 
             : pedidoDoBanco.itens_pedido || [];
@@ -572,7 +571,6 @@ app.post('/rastrear-pedido', async (req, res) => {
             ? JSON.parse(pedidoDoBanco.info_frete)
             : pedidoDoBanco.info_frete || {};
         
-        // Mapeamento para garantir que o formato está correto para o frontend
         const itensFormatados = itens.map(item => ({
             id: item.id,
             nome: item.title,
