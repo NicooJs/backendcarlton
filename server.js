@@ -57,15 +57,18 @@ const {
 
   // Email (Resend)
   RESEND_API_KEY,
-  EMAIL_FROM,
+  EMAIL_FROM, // compat (se existir)
+  EMAIL_FROM_PRIMARY,
+  EMAIL_FROM_FALLBACK,
   EMAIL_TO,
 
-  // Email (Gmail SMTP - fallback temporário)
+  // Email (Gmail SMTP - opcional local)
   GMAIL_USER,
   GMAIL_APP_PASSWORD,
   MAIL_FROM_NAME,
   MAIL_REPLY_TO,
-  // Opcional: força usar gmail/resend
+
+  // Opcional: força usar gmail/resend/auto
   MAIL_PROVIDER, // "gmail" | "resend" | "auto"
 
   // Segurança (cron)
@@ -100,23 +103,27 @@ if (!CRON_SECRET) {
   log('warn', 'BOOT/WARN', 'CRON_SECRET não definido. A rota /checar-pedidos-expirados ficará pública.');
 }
 if (!RESEND_API_KEY) {
-  log('warn', 'MAIL/BOOT/WARN', 'RESEND_API_KEY ausente. Resend desativado (vou tentar Gmail se configurado).');
+  log('warn', 'MAIL/BOOT/WARN', 'RESEND_API_KEY ausente. Resend desativado.');
 }
-if (!EMAIL_FROM) {
-  log('warn', 'MAIL/BOOT/WARN', 'EMAIL_FROM ausente. Ex: "Carlton <onboarding@resend.dev>" ou "Carlton <seuemail@gmail.com>".');
+if (!EMAIL_FROM_PRIMARY && !EMAIL_FROM_FALLBACK && !EMAIL_FROM) {
+  log(
+    'warn',
+    'MAIL/BOOT/WARN',
+    'EMAIL_FROM_PRIMARY/EMAIL_FROM_FALLBACK (ou EMAIL_FROM compat) ausentes. Ex: "Carlton <onboarding@resend.dev>".'
+  );
 }
 if (!EMAIL_TO) {
   log('warn', 'MAIL/BOOT/WARN', 'EMAIL_TO ausente. Recomendo um email admin pra cópia/teste.');
 }
 if (!GMAIL_USER || !GMAIL_APP_PASSWORD) {
-  log('warn', 'MAIL/BOOT/WARN', 'GMAIL_USER/GMAIL_APP_PASSWORD ausentes. Gmail SMTP desativado (fallback não disponível).');
+  log('warn', 'MAIL/BOOT/WARN', 'GMAIL_USER/GMAIL_APP_PASSWORD ausentes. Gmail SMTP desativado (ok no Railway).');
 }
 
 // --- CONFIGURAÇÃO DOS SERVIÇOS ---
 const client = new MercadoPagoConfig({ accessToken: MP_ACCESS_TOKEN });
 const resend = RESEND_API_KEY ? new Resend(RESEND_API_KEY) : null;
 
-// Gmail SMTP (fallback)
+// Gmail SMTP (opcional)
 const gmailTransporter =
   GMAIL_USER && GMAIL_APP_PASSWORD
     ? nodemailer.createTransport({
@@ -127,12 +134,15 @@ const gmailTransporter =
       })
     : null;
 
-// (Opcional) valida no boot pra você saber se o SMTP tá OK
-if (gmailTransporter) {
+// ✅ EVITA timeout no Railway: só verifica SMTP se provider for gmail
+const effectiveProvider = String(MAIL_PROVIDER || 'resend').toLowerCase();
+if (gmailTransporter && effectiveProvider === 'gmail') {
   gmailTransporter
     .verify()
     .then(() => log('info', 'MAIL/GMAIL/OK', 'Gmail SMTP pronto'))
-    .catch((err) => log('warn', 'MAIL/GMAIL/WARN', 'Gmail SMTP não validou no boot (pode funcionar mesmo assim)', { message: err?.message }));
+    .catch((err) =>
+      log('warn', 'MAIL/GMAIL/WARN', 'Gmail SMTP não validou no boot (pode funcionar mesmo assim)', { message: err?.message })
+    );
 }
 
 // ------------------------
@@ -191,9 +201,6 @@ const validateMpWebhook = (req) => {
 // ------------------------
 // EMAIL TEMPLATES (EDITÁVEL)
 // ------------------------
-// ✅ Onde editar o texto depois: aqui no EMAIL_COPY.
-// ✅ Onde editar layout/HTML: nas funções emailLayout/render* abaixo.
-
 const escapeHtml = (str = '') =>
   String(str)
     .replace(/&/g, '&amp;')
@@ -444,7 +451,7 @@ function buildEmail(type, pedido, extra = {}) {
 }
 
 // ------------------------
-// EMAIL SENDER (Resend + Gmail fallback)
+// EMAIL SENDER (Resend + Gmail opcional)
 // ------------------------
 const normalizeList = (v) => (Array.isArray(v) ? v : v ? [v] : []);
 
@@ -454,31 +461,87 @@ const getFromDomain = (fromStr = '') => {
   return email.split('@')[1] || null;
 };
 
+const isDomainNotVerified403 = (error) => {
+  const status = Number(error?.statusCode || error?.status || 0);
+  const msg = String(error?.message || '').toLowerCase();
+  return status === 403 && (msg.includes('domain is not verified') || msg.includes('not verified'));
+};
+
 async function sendEmailViaResend({ to, subject, html, bcc }) {
   if (!resend) return { ok: false, reason: 'missing_resend_key' };
-  if (!EMAIL_FROM) return { ok: false, reason: 'missing_email_from' };
 
-  try {
-    const payload = {
-      from: EMAIL_FROM,
-      to: normalizeList(to),
-      subject,
-      html,
-    };
-    const bccList = normalizeList(bcc);
-    if (bccList.length) payload.bcc = bccList;
+  // ✅ prioridade: PRIMARY -> (fallback automático) -> compat EMAIL_FROM -> default resend
+  const primaryFrom = EMAIL_FROM_PRIMARY || '';
+  const fallbackFrom = EMAIL_FROM_FALLBACK || 'Carlton <onboarding@resend.dev>';
+  const compatFrom = EMAIL_FROM || '';
 
-    log('info', 'MAIL/DEBUG', 'Resend FROM domain', { domain: getFromDomain(EMAIL_FROM) });
+  const toList = normalizeList(to);
+  const bccList = normalizeList(bcc);
+
+  const basePayload = {
+    to: toList,
+    subject,
+    html,
+  };
+  if (bccList.length) basePayload.bcc = bccList;
+
+  // helper de envio
+  const trySend = async (from) => {
+    const payload = { ...basePayload, from };
+    if (MAIL_REPLY_TO) payload.reply_to = MAIL_REPLY_TO;
+
+    log('info', 'MAIL/RESEND/TRY', 'Tentando Resend', { from, domain: getFromDomain(from) });
 
     const { data, error } = await resend.emails.send(payload);
+    if (error) return { ok: false, error };
+    return { ok: true, id: data?.id };
+  };
 
-    if (error) {
-      log('error', 'MAIL/RESEND/ERROR', 'Erro ao enviar via Resend', { error });
-      return { ok: false, reason: 'resend_error', error };
+  try {
+    // 1) tenta PRIMARY se existir
+    if (primaryFrom) {
+      const r1 = await trySend(primaryFrom);
+      if (r1.ok) {
+        log('info', 'MAIL/RESEND/OK', 'Email enviado via Resend (primary)', { id: r1.id, to: toList, subject });
+        return { ok: true, id: r1.id, provider: 'resend', fromUsed: primaryFrom };
+      }
+
+      // se falhou por domínio não verificado, cai pro fallback
+      if (isDomainNotVerified403(r1.error)) {
+        log('warn', 'MAIL/RESEND/FROM_FALLBACK', 'Domínio não verificado — usando fallback', { error: r1.error });
+        const r2 = await trySend(fallbackFrom);
+        if (!r2.ok) {
+          log('error', 'MAIL/RESEND/ERROR', 'Erro ao enviar via Resend (fallback)', { error: r2.error });
+          return { ok: false, reason: 'resend_error', error: r2.error };
+        }
+        log('info', 'MAIL/RESEND/OK', 'Email enviado via Resend (fallback)', { id: r2.id, to: toList, subject });
+        return { ok: true, id: r2.id, provider: 'resend', fromUsed: fallbackFrom };
+      }
+
+      // erro diferente -> retorna
+      log('error', 'MAIL/RESEND/ERROR', 'Erro ao enviar via Resend (primary)', { error: r1.error });
+      return { ok: false, reason: 'resend_error', error: r1.error };
     }
 
-    log('info', 'MAIL/RESEND/OK', 'Email enviado via Resend', { id: data?.id, to: payload.to, subject });
-    return { ok: true, id: data?.id, provider: 'resend' };
+    // 2) se não tem primary, tenta compat EMAIL_FROM se existir
+    if (compatFrom) {
+      const r = await trySend(compatFrom);
+      if (!r.ok) {
+        log('error', 'MAIL/RESEND/ERROR', 'Erro ao enviar via Resend (EMAIL_FROM)', { error: r.error });
+        return { ok: false, reason: 'resend_error', error: r.error };
+      }
+      log('info', 'MAIL/RESEND/OK', 'Email enviado via Resend (EMAIL_FROM)', { id: r.id, to: toList, subject });
+      return { ok: true, id: r.id, provider: 'resend', fromUsed: compatFrom };
+    }
+
+    // 3) fallback puro
+    const rf = await trySend(fallbackFrom);
+    if (!rf.ok) {
+      log('error', 'MAIL/RESEND/ERROR', 'Erro ao enviar via Resend (fallback)', { error: rf.error });
+      return { ok: false, reason: 'resend_error', error: rf.error };
+    }
+    log('info', 'MAIL/RESEND/OK', 'Email enviado via Resend (fallback)', { id: rf.id, to: toList, subject });
+    return { ok: true, id: rf.id, provider: 'resend', fromUsed: fallbackFrom };
   } catch (err) {
     log('error', 'MAIL/RESEND/FATAL', 'Falha inesperada Resend', { message: err?.message, stack: err?.stack });
     return { ok: false, reason: 'exception', error: err?.message, provider: 'resend' };
@@ -490,7 +553,6 @@ async function sendEmailViaGmail({ to, subject, html, bcc }) {
   if (!GMAIL_USER) return { ok: false, reason: 'missing_gmail_user' };
 
   try {
-    // Se EMAIL_FROM não existir, usa nome + gmail
     const fromName = MAIL_FROM_NAME || 'CARLTON';
     const fromEmail = GMAIL_USER;
 
@@ -519,30 +581,24 @@ async function sendEmailViaGmail({ to, subject, html, bcc }) {
   }
 }
 
-// AUTO: tenta Resend -> se falhar tenta Gmail
 async function sendEmail({ to, subject, html, bcc }) {
-  const provider = String(MAIL_PROVIDER || 'auto').toLowerCase();
+  const provider = String(MAIL_PROVIDER || 'resend').toLowerCase();
 
+  // ✅ Produção Railway: Resend (auto = resend) -> nada de SMTP travando
+  if (provider === 'resend' || provider === 'auto' || !provider) {
+    const r = await sendEmailViaResend({ to, subject, html, bcc });
+    if (!r.ok) log('warn', 'MAIL/RESEND/SKIP', 'Resend falhou', r);
+    return r;
+  }
+
+  // gmail só se você setar explicitamente (ex: local)
   if (provider === 'gmail') {
     const r = await sendEmailViaGmail({ to, subject, html, bcc });
     if (!r.ok) log('warn', 'MAIL/GMAIL/SKIP', 'Gmail falhou', r);
     return r;
   }
 
-  if (provider === 'resend') {
-    const r = await sendEmailViaResend({ to, subject, html, bcc });
-    if (!r.ok) log('warn', 'MAIL/RESEND/SKIP', 'Resend falhou', r);
-    return r;
-  }
-
-  // auto
-  const r1 = await sendEmailViaResend({ to, subject, html, bcc });
-  if (r1.ok) return r1;
-
-  log('warn', 'MAIL/FALLBACK', 'Resend não enviou — tentando Gmail', { reason: r1.reason });
-
-  const r2 = await sendEmailViaGmail({ to, subject, html, bcc });
-  return r2.ok ? r2 : { ok: false, reason: 'all_providers_failed', resend: r1, gmail: r2 };
+  return { ok: false, reason: 'unknown_provider', provider };
 }
 
 // ------------------- ROTAS DA APLICAÇÃO -------------------
@@ -561,7 +617,7 @@ app.get('/test-email', async (req, res) => {
     preheader: 'Se você recebeu isso, o envio do backend está OK.',
     contentHtml: `
       <p><strong>🔥 Email funcionando!</strong></p>
-      <p>Se você recebeu isso, o envio do backend está OK (Resend ou Gmail).</p>
+      <p>Se você recebeu isso, o envio do backend está OK (Resend).</p>
       <p><strong>Data:</strong> ${escapeHtml(new Date().toISOString())}</p>
     `,
   });
@@ -574,7 +630,7 @@ app.get('/test-email', async (req, res) => {
   });
 
   if (!result.ok) return res.status(500).json({ ok: false, result });
-  return res.status(200).json({ ok: true, provider: result.provider, id: result.id, to });
+  return res.status(200).json({ ok: true, provider: result.provider, id: result.id, to, fromUsed: result.fromUsed });
 });
 
 // ✅ Teste do template de rastreio (sem Melhor Envio)
@@ -600,7 +656,7 @@ app.get('/test-tracking-email', async (req, res) => {
   });
 
   if (!result.ok) return res.status(500).json({ ok: false, result });
-  return res.status(200).json({ ok: true, provider: result.provider, id: result.id, to, pedidoId, tracking });
+  return res.status(200).json({ ok: true, provider: result.provider, id: result.id, to, pedidoId, tracking, fromUsed: result.fromUsed });
 });
 
 // ROTA /criar-preferencia
@@ -974,11 +1030,9 @@ app.get('/checar-pedidos-expirados', async (req, res) => {
     res.status(200).json({ message: `Checagem concluída. ${pedidosExpirados.length} pedidos atualizados.` });
   } catch (error) {
     log('error', 'CRON/EXPIRACAO/ERROR', 'Erro ao checar pedidos expirados', { message: error?.message, stack: error?.stack });
-    res.status(500).json({ error: 'Erro interno na checagem de pedidos.' });
+    res.status(500).json({ error: 'Erro interno na checagem de pedidos expirados.' });
   }
 });
-
-// ------------------- FUNÇÕES DE EMAIL -------------------
 
 // ------------------- PREVIEW DE EMAIL (DEV / TESTE) -------------------
 // ⚠️ Não envia email — apenas renderiza o HTML no navegador
@@ -1019,6 +1073,7 @@ app.get('/preview-email', async (req, res) => {
   }
 });
 
+// ------------------- FUNÇÕES DE EMAIL -------------------
 async function enviarEmailDeConfirmacao(pedido) {
   const { subject, html } = buildEmail('confirm', pedido);
 
@@ -1029,7 +1084,7 @@ async function enviarEmailDeConfirmacao(pedido) {
     html,
   });
 
-  if (result.ok) log('info', 'MAIL/CONFIRM/OK', 'E-mail de confirmação enviado', { pedidoId: pedido.id, provider: result.provider, id: result.id });
+  if (result.ok) log('info', 'MAIL/CONFIRM/OK', 'E-mail de confirmação enviado', { pedidoId: pedido.id, provider: result.provider, id: result.id, fromUsed: result.fromUsed });
   else log('error', 'MAIL/CONFIRM/ERROR', 'Erro ao enviar e-mail de confirmação', { pedidoId: pedido.id, result });
 }
 
@@ -1043,7 +1098,7 @@ async function enviarEmailComRastreio(pedido, trackingCode) {
     html,
   });
 
-  if (result.ok) log('info', 'MAIL/TRACK/OK', 'E-mail de rastreio enviado', { pedidoId: pedido.id, provider: result.provider, id: result.id });
+  if (result.ok) log('info', 'MAIL/TRACK/OK', 'E-mail de rastreio enviado', { pedidoId: pedido.id, provider: result.provider, id: result.id, fromUsed: result.fromUsed });
   else log('error', 'MAIL/TRACK/ERROR', 'Erro ao enviar e-mail de rastreio', { pedidoId: pedido.id, result });
 }
 
@@ -1057,7 +1112,7 @@ async function enviarEmailDeExpiracao(pedido) {
     html,
   });
 
-  if (result.ok) log('info', 'MAIL/EXPIRY/OK', 'E-mail de expiração enviado', { pedidoId: pedido.id, provider: result.provider, id: result.id });
+  if (result.ok) log('info', 'MAIL/EXPIRY/OK', 'E-mail de expiração enviado', { pedidoId: pedido.id, provider: result.provider, id: result.id, fromUsed: result.fromUsed });
   else log('error', 'MAIL/EXPIRY/ERROR', 'Erro ao enviar e-mail de expiração', { pedidoId: pedido.id, result });
 }
 
