@@ -7,7 +7,6 @@ import cors from 'cors';
 import { MercadoPagoConfig, Preference, Payment } from 'mercadopago';
 import dotenv from 'dotenv';
 import fetch from 'node-fetch';
-import nodemailer from 'nodemailer';
 import db from './db.js';
 import crypto from 'crypto';
 
@@ -15,12 +14,8 @@ import crypto from 'crypto';
 dotenv.config();
 const app = express();
 const port = process.env.PORT || 4000;
-
-// CORS (mantém permissivo como estava para não quebrar o frontend)
-// Se quiser endurecer depois, a gente restringe por FRONTEND_URL.
 app.use(cors());
 
-// Precisa para validar assinatura (rawBody)
 app.use(express.json({
   verify: (req, res, buf) => {
     req.rawBody = buf;
@@ -31,78 +26,38 @@ app.use(express.json({
 // LOGGING (somente logs)
 // ------------------------
 const safeJson = (obj) => {
-  try {
-    return JSON.stringify(obj, null, 2);
-  } catch {
-    return '[unserializable]';
-  }
+  try { return JSON.stringify(obj, null, 2); } catch { return '[unserializable]'; }
 };
 
 const log = (level, scope, message, meta) => {
   const prefix = `[${scope}]`;
   const line = meta !== undefined ? `${prefix} ${message} ${safeJson(meta)}` : `${prefix} ${message}`;
-
   if (level === 'error') return console.error(line);
   if (level === 'warn') return console.warn(line);
   return console.log(line);
 };
 
-// ------------------------
-// ENV
-// ------------------------
+// --- VARIÁVEIS DE AMBIENTE ---
 const {
-  MP_ACCESS_TOKEN,
-  MELHOR_ENVIO_TOKEN,
-  SENDER_CEP,
-  BACKEND_URL,
+  MP_ACCESS_TOKEN, MELHOR_ENVIO_TOKEN, SENDER_CEP, BACKEND_URL,
   FRONTEND_URL,
 
-  EMAIL_HOST,
-  EMAIL_PORT,
-  EMAIL_SECURE,
-  EMAIL_USER,
-  EMAIL_PASS,
+  // email via API
+  EMAIL_PROVIDER,
+  RESEND_API_KEY,
+  EMAIL_FROM,
   EMAIL_TO,
 
-  SENDER_NAME,
-  SENDER_PHONE,
-  SENDER_EMAIL,
-  SENDER_DOCUMENT,
-  SENDER_STREET,
-  SENDER_NUMBER,
-  SENDER_COMPLEMENT,
-  SENDER_DISTRICT,
-  SENDER_CITY,
-  SENDER_STATE_ABBR,
+  SENDER_NAME, SENDER_PHONE, SENDER_EMAIL,
+  SENDER_DOCUMENT, SENDER_STREET, SENDER_NUMBER, SENDER_COMPLEMENT,
+  SENDER_DISTRICT, SENDER_CITY, SENDER_STATE_ABBR,
 
   MP_WEBHOOK_SECRET,
-
-  // opcional: proteger rota de cron (recomendado)
-  CRON_TOKEN,
 } = process.env;
 
-// Validação de env (causa raiz: antes você não garantia vars do email)
-const missing = [];
-const requireEnv = (key, val) => {
-  if (!val) missing.push(key);
-};
-
-requireEnv('MP_ACCESS_TOKEN', MP_ACCESS_TOKEN);
-requireEnv('MELHOR_ENVIO_TOKEN', MELHOR_ENVIO_TOKEN);
-requireEnv('BACKEND_URL', BACKEND_URL);
-requireEnv('FRONTEND_URL', FRONTEND_URL);
-
-requireEnv('EMAIL_HOST', EMAIL_HOST);
-requireEnv('EMAIL_PORT', EMAIL_PORT);
-requireEnv('EMAIL_SECURE', EMAIL_SECURE);
-requireEnv('EMAIL_USER', EMAIL_USER);
-requireEnv('EMAIL_PASS', EMAIL_PASS);
-
-// db é importado, mas pode falhar no runtime — aqui só garantimos que existe referência
-if (!db) missing.push('db');
-
-if (missing.length) {
-  log('error', 'BOOT/FATAL', 'Variáveis essenciais ausentes. Verifique .env / Railway Variables.', { missing });
+// Validação das variáveis de ambiente
+if (!MP_ACCESS_TOKEN || !MELHOR_ENVIO_TOKEN || !BACKEND_URL || !FRONTEND_URL || !db) {
+  log('error', 'BOOT/FATAL', 'Variáveis essenciais ausentes. Verifique .env / Railway Variables.');
   process.exit(1);
 }
 
@@ -110,80 +65,67 @@ if (!MP_WEBHOOK_SECRET) {
   log('warn', 'BOOT/WARN', 'MP_WEBHOOK_SECRET não encontrada. Validação do webhook Mercado Pago DESATIVADA.');
 }
 
-if (!EMAIL_TO) {
-  log('warn', 'BOOT/WARN', 'EMAIL_TO não definida. Você não receberá cópia (BCC) dos e-mails de confirmação.');
+// Email provider validation
+if ((EMAIL_PROVIDER || 'resend') === 'resend') {
+  if (!RESEND_API_KEY) log('warn', 'MAIL/WARN', 'RESEND_API_KEY ausente. Emails não serão enviados.');
+  if (!EMAIL_FROM) log('warn', 'MAIL/WARN', 'EMAIL_FROM ausente. Emails podem falhar no provedor.');
 }
 
-if (!CRON_TOKEN) {
-  log('warn', 'BOOT/WARN', 'CRON_TOKEN não definido. A rota /checar-pedidos-expirados ficará pública.');
-}
-
-// ------------------------
-// SERVIÇOS
-// ------------------------
+// --- CONFIGURAÇÃO DOS SERVIÇOS ---
 const client = new MercadoPagoConfig({ accessToken: MP_ACCESS_TOKEN });
 
-// Dica causa raiz: SMTP pode “pendurar” — defina timeouts.
-const transporter = nodemailer.createTransport({
-  host: EMAIL_HOST,
-  port: parseInt(EMAIL_PORT, 10),
-  secure: String(EMAIL_SECURE).toLowerCase() === 'true',
-  auth: { user: EMAIL_USER, pass: EMAIL_PASS },
-
-  // timeouts para não travar worker
-  connectionTimeout: 15000,
-  greetingTimeout: 15000,
-  socketTimeout: 20000,
-});
-
-// valida SMTP no boot (não derruba o server, só loga)
-(async () => {
-  try {
-    await transporter.verify();
-    log('info', 'MAIL/BOOT/OK', 'SMTP verificado com sucesso', { host: EMAIL_HOST, port: EMAIL_PORT, secure: EMAIL_SECURE });
-  } catch (e) {
-    log('error', 'MAIL/BOOT/ERROR', 'Falha ao verificar SMTP. E-mails podem falhar.', {
-      message: e?.message,
-      code: e?.code,
-      host: EMAIL_HOST,
-      port: EMAIL_PORT,
-      secure: EMAIL_SECURE
-    });
-  }
-})();
-
 // ------------------------
-// HELPERS
+// HELPERS EMAIL (RESEND)
 // ------------------------
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
-const sendMailSafe = async (payload, scope, meta = {}) => {
+const sendEmail = async ({ to, subject, html, bcc }) => {
+  // Se não tiver key, só loga e retorna false (não quebra pagamento/frete)
+  if (!RESEND_API_KEY) {
+    log('warn', 'MAIL/SKIP', 'RESEND_API_KEY ausente. Pulando envio.', { to, subject });
+    return false;
+  }
+
   try {
-    await transporter.sendMail(payload);
-    log('info', scope, 'E-mail enviado', meta);
+    const payload = {
+      from: EMAIL_FROM,
+      to: Array.isArray(to) ? to : [to],
+      subject,
+      html,
+    };
+    if (bcc) payload.bcc = Array.isArray(bcc) ? bcc : [bcc];
+
+    const resp = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${RESEND_API_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(payload),
+    });
+
+    const data = await resp.json().catch(() => ({}));
+
+    if (!resp.ok) {
+      log('error', 'MAIL/ERROR', 'Resend retornou erro', { status: resp.status, data });
+      return false;
+    }
+
+    log('info', 'MAIL/OK', 'E-mail enviado via Resend', { to, subject, id: data?.id });
     return true;
   } catch (error) {
-    log('error', scope, 'Erro ao enviar e-mail', {
-      ...meta,
-      message: error?.message,
-      code: error?.code,
-      response: error?.response
-    });
+    log('error', 'MAIL/ERROR', 'Falha ao enviar via Resend', { message: error?.message, stack: error?.stack });
     return false;
   }
 };
 
-/**
- * Parse robusto do header x-signature do Mercado Pago.
- * Ex esperado: "ts=1742505638683,v1=abcdef..."
- */
+// ------------------------
+// WEBHOOK SIGNATURE (MP)
+// ------------------------
 const parseXSignature = (raw) => {
   if (!raw || typeof raw !== 'string') return { ts: null, v1: null };
-
   const parts = raw.split(',');
-  let ts = null;
-  let v1 = null;
-
+  let ts = null, v1 = null;
   for (const part of parts) {
     const [k, v] = part.split('=');
     if (!k || !v) continue;
@@ -192,14 +134,9 @@ const parseXSignature = (raw) => {
     if (key === 'ts') ts = val;
     if (key === 'v1') v1 = val;
   }
-
   return { ts, v1 };
 };
 
-/**
- * Validação do webhook MP com manifest correto:
- * id:<id>;request-id:<x-request-id>;ts:<ts>;
- */
 const verifyMercadoPagoSignature = (req) => {
   if (!MP_WEBHOOK_SECRET) return { ok: true, reason: 'disabled' };
 
@@ -212,23 +149,12 @@ const verifyMercadoPagoSignature = (req) => {
   if (!paymentId) return { ok: false, reason: 'missing_id' };
 
   const { ts, v1 } = parseXSignature(xSignature);
-  if (!ts || !v1) return { ok: false, reason: 'bad_x_signature_format', xSignature };
+  if (!ts || !v1) return { ok: false, reason: 'bad_x_signature_format' };
 
   const manifest = `id:${paymentId};request-id:${String(xRequestId).trim()};ts:${String(ts).trim()};`;
-  const expected = crypto
-    .createHmac('sha256', MP_WEBHOOK_SECRET)
-    .update(manifest)
-    .digest('hex');
+  const expected = crypto.createHmac('sha256', MP_WEBHOOK_SECRET).update(manifest).digest('hex');
 
-  const ok = expected === v1;
-  return {
-    ok,
-    reason: ok ? 'ok' : 'invalid_signature',
-    paymentId,
-    topic: req.query?.topic || req.query?.type,
-    ts,
-    requestId: xRequestId,
-  };
+  return { ok: expected === v1, reason: expected === v1 ? 'ok' : 'invalid_signature' };
 };
 
 // ------------------- ROTAS DA APLICAÇÃO -------------------
@@ -254,10 +180,10 @@ app.post('/criar-preferencia', async (req, res) => {
     const fullAddress = `${customerInfo.address}, ${customerInfo.number} ${customerInfo.complement || ''} - ${customerInfo.neighborhood}, ${customerInfo.city}/${customerInfo.state}, CEP: ${customerInfo.cep}`;
 
     const sql = `INSERT INTO pedidos (
-            nome_cliente, email_cliente, cpf_cliente, telefone_cliente, 
-            endereco_entrega, cep, logradouro, numero, complemento, bairro, cidade, estado,
-            itens_pedido, info_frete, valor_total, status, expiracao_pix
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'AGUARDANDO_PAGAMENTO', ?);`;
+      nome_cliente, email_cliente, cpf_cliente, telefone_cliente, 
+      endereco_entrega, cep, logradouro, numero, complemento, bairro, cidade, estado,
+      itens_pedido, info_frete, valor_total, status, expiracao_pix
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'AGUARDANDO_PAGAMENTO', ?);`;
 
     const expiracaoPix = new Date(Date.now() + 30 * 60 * 1000);
 
@@ -425,7 +351,6 @@ app.post('/calcular-frete', async (req, res) => {
 
 // ROTA DE WEBHOOK PARA NOTIFICAÇÕES DO MERCADO PAGO
 app.post('/notificacao-pagamento', async (req, res) => {
-  // 1) valida assinatura
   const sig = verifyMercadoPagoSignature(req);
   if (!sig.ok) {
     log('error', 'MP/WEBHOOK/SIG_INVALID', 'Assinatura inválida (bloqueado)', {
@@ -437,17 +362,10 @@ app.post('/notificacao-pagamento', async (req, res) => {
     return res.status(401).send('Invalid signature');
   }
 
-  if (sig.reason === 'disabled') {
-    log('warn', 'MP/WEBHOOK/WARN', 'Validação de assinatura desativada (MP_WEBHOOK_SECRET ausente)');
-  }
-
   const topic = req.query.topic || req.query.type;
   const paymentIdCandidate = req.query.id || req.query['data.id'];
 
-  log('info', 'MP/WEBHOOK/IN', 'Notificação recebida', {
-    topic,
-    id: paymentIdCandidate
-  });
+  log('info', 'MP/WEBHOOK/IN', 'Notificação recebida', { topic, id: paymentIdCandidate });
 
   if (topic === 'payment') {
     try {
@@ -461,21 +379,18 @@ app.post('/notificacao-pagamento', async (req, res) => {
         if (rows.length > 0) {
           const pedidoDoBanco = rows[0];
 
-          // Evita processar novamente um pedido já pago ou em produção
           if (pedidoDoBanco.status !== 'AGUARDANDO_PAGAMENTO' && pedidoDoBanco.status !== 'PAGAMENTO_PENDENTE') {
-            log('info', 'MP/IDEMPOTENT', 'Pedido já processado, ignorando', {
-              pedidoId,
-              status: pedidoDoBanco.status
-            });
+            log('info', 'MP/IDEMPOTENT', 'Pedido já processado, ignorando', { pedidoId, status: pedidoDoBanco.status });
           } else {
             const isApproved = payment.status === 'approved';
             const novoStatus = isApproved ? 'EM_PRODUCAO' : 'PAGAMENTO_PENDENTE';
 
             if (isApproved) {
-              const metodoPagamento = payment.payment_type_id === 'credit_card' ? 'Cartão de Crédito' :
+              const metodoPagamento =
+                payment.payment_type_id === 'credit_card' ? 'Cartão de Crédito' :
                 payment.payment_type_id === 'ticket' ? 'Boleto' :
-                  payment.payment_method_id === 'pix' ? 'PIX' :
-                    (payment.payment_method_id || 'Não especificado');
+                payment.payment_method_id === 'pix' ? 'PIX' :
+                (payment.payment_method_id || 'Não especificado');
 
               const finalCartao = payment.card ? payment.card.last_four_digits : null;
 
@@ -493,7 +408,6 @@ app.post('/notificacao-pagamento', async (req, res) => {
                 metodo: metodoPagamento
               });
 
-              // email + melhor envio: não quebra fluxo se email falhar
               await enviarEmailDeConfirmacao({ ...pedidoDoBanco, mercado_pago_id: payment.id });
               await inserirPedidoNoCarrinhoME(pedidoDoBanco);
 
@@ -503,10 +417,7 @@ app.post('/notificacao-pagamento', async (req, res) => {
                 [novoStatus, payment.id, pedidoId]
               );
 
-              log('info', 'MP/PAGAMENTO/PENDENTE', 'Pedido atualizado para PAGAMENTO_PENDENTE', {
-                pedidoId,
-                paymentId: payment.id
-              });
+              log('info', 'MP/PAGAMENTO/PENDENTE', 'Pedido atualizado para PAGAMENTO_PENDENTE', { pedidoId, paymentId: payment.id });
             }
           }
         } else {
@@ -516,13 +427,9 @@ app.post('/notificacao-pagamento', async (req, res) => {
         log('warn', 'MP/WEBHOOK/NO_REF', 'Payment sem external_reference', { paymentId: paymentIdCandidate });
       }
     } catch (error) {
-      log('error', 'MP/WEBHOOK/ERROR', 'Erro ao processar notificação', {
-        message: error?.message,
-        stack: error?.stack
-      });
+      log('error', 'MP/WEBHOOK/ERROR', 'Erro ao processar notificação', { message: error?.message, stack: error?.stack });
     }
   } else {
-    // merchant_order e outros topics podem chegar — não tratamos aqui
     log('info', 'MP/WEBHOOK/IGNORED', 'Notificação ignorada (topic não suportado)', { topic });
   }
 
@@ -546,11 +453,7 @@ app.post('/webhook-melhorenvio', async (req, res) => {
         const sql = "UPDATE pedidos SET codigo_rastreio = ?, status = 'ENVIADO' WHERE id = ?";
         await db.query(sql, [tracking, pedido.id]);
 
-        log('info', 'ME/TRACKING/OK', 'Pedido atualizado para ENVIADO', {
-          pedidoId: pedido.id,
-          melhorEnvioId: id,
-          tracking
-        });
+        log('info', 'ME/TRACKING/OK', 'Pedido atualizado para ENVIADO', { pedidoId: pedido.id, melhorEnvioId: id, tracking });
 
         await enviarEmailComRastreio(pedido, tracking);
       } else {
@@ -565,25 +468,13 @@ app.post('/webhook-melhorenvio', async (req, res) => {
 
     res.status(200).send("Webhook do Melhor Envio processado com sucesso");
   } catch (error) {
-    log('error', 'ME/WEBHOOK/ERROR', 'Erro ao processar webhook Melhor Envio', {
-      message: error?.message,
-      stack: error?.stack
-    });
+    log('error', 'ME/WEBHOOK/ERROR', 'Erro ao processar webhook Melhor Envio', { message: error?.message, stack: error?.stack });
     res.status(500).send("Erro no processamento do webhook");
   }
 });
 
 // ROTA PARA CHECAR PEDIDOS EXPIRADOS
 app.get('/checar-pedidos-expirados', async (req, res) => {
-  // proteção opcional (recomendado)
-  if (CRON_TOKEN) {
-    const token = req.headers['x-cron-token'] || req.query.token;
-    if (token !== CRON_TOKEN) {
-      log('warn', 'CRON/AUTH', 'Tentativa sem token', { ip: req.ip });
-      return res.status(401).json({ error: 'Unauthorized' });
-    }
-  }
-
   log('info', 'CRON/EXPIRACAO/IN', 'Iniciando checagem de pedidos expirados.');
 
   try {
@@ -591,36 +482,28 @@ app.get('/checar-pedidos-expirados', async (req, res) => {
       "SELECT * FROM pedidos WHERE status = 'AGUARDANDO_PAGAMENTO' AND expiracao_pix < NOW();"
     );
 
-    let cancelados = 0;
     for (const pedido of pedidosExpirados) {
       await db.query("UPDATE pedidos SET status = 'CANCELADO_POR_EXPIRACAO' WHERE id = ?", [pedido.id]);
 
       const ok = await enviarEmailDeExpiracao(pedido);
-      if (ok) {
-        log('info', 'CRON/EXPIRACAO/CANCEL', 'Pedido cancelado por expiração e e-mail enviado', { pedidoId: pedido.id });
-      } else {
-        log('warn', 'CRON/EXPIRACAO/CANCEL', 'Pedido cancelado por expiração, mas e-mail falhou', { pedidoId: pedido.id });
-      }
-
-      cancelados++;
+      log(ok ? 'info' : 'warn', 'CRON/EXPIRACAO/CANCEL', ok
+        ? 'Pedido cancelado por expiração e e-mail enviado'
+        : 'Pedido cancelado por expiração, mas e-mail falhou',
+        { pedidoId: pedido.id }
+      );
     }
 
-    log('info', 'CRON/EXPIRACAO/OK', 'Checagem concluída', { cancelados });
-    res.status(200).json({ message: `Checagem concluída. ${cancelados} pedidos atualizados.` });
+    log('info', 'CRON/EXPIRACAO/OK', 'Checagem concluída', { cancelados: pedidosExpirados.length });
+    res.status(200).json({ message: `Checagem concluída. ${pedidosExpirados.length} pedidos atualizados.` });
   } catch (error) {
-    log('error', 'CRON/EXPIRACAO/ERROR', 'Erro ao checar pedidos expirados', {
-      message: error?.message,
-      stack: error?.stack
-    });
+    log('error', 'CRON/EXPIRACAO/ERROR', 'Erro ao checar pedidos expirados', { message: error?.message, stack: error?.stack });
     res.status(500).json({ error: "Erro interno na checagem de pedidos." });
   }
 });
 
-// ------------------------
-// EMAILS
-// ------------------------
+// ------------------- EMAILS -------------------
 
-// FUNÇÃO AUXILIAR DE ENVIO DE E-MAIL - CONFIRMAÇÃO
+// CONFIRMAÇÃO: cliente recebe no "to" + você em BCC (EMAIL_TO)
 async function enviarEmailDeConfirmacao(pedido) {
   const itens = typeof pedido.itens_pedido === 'string' ? JSON.parse(pedido.itens_pedido) : pedido.itens_pedido;
   const frete = typeof pedido.info_frete === 'string' ? JSON.parse(pedido.info_frete) : pedido.info_frete;
@@ -643,22 +526,19 @@ async function enviarEmailDeConfirmacao(pedido) {
     <h3><strong>Total:</strong> R$ ${Number(pedido.valor_total).toFixed(2)}</h3>
   `;
 
-  // Agora: cliente recebe direto (personalizado) + admin em BCC (se tiver)
-  const mail = {
-    from: `"Carlton" <${EMAIL_USER}>`,
+  const bcc = EMAIL_TO ? EMAIL_TO : undefined;
+
+  const ok = await sendEmail({
     to: pedido.email_cliente,
+    bcc,
     subject: `Confirmação do Pedido #${pedido.id}`,
     html: emailBody,
-  };
+  });
 
-  if (EMAIL_TO) {
-    mail.bcc = EMAIL_TO;
-  }
-
-  return sendMailSafe(mail, 'MAIL/CONFIRM', { pedidoId: pedido.id });
+  log(ok ? 'info' : 'warn', 'MAIL/CONFIRM', ok ? 'E-mail de confirmação enviado' : 'Falha ao enviar e-mail de confirmação', { pedidoId: pedido.id });
 }
 
-// FUNÇÃO: ENVIAR E-MAIL COM RASTREIO
+// RASTREIO
 async function enviarEmailComRastreio(pedido, trackingCode) {
   const emailBody = `
     <h1>📦 Seu pedido foi postado!</h1>
@@ -668,21 +548,19 @@ async function enviarEmailComRastreio(pedido, trackingCode) {
     <p>Acompanhe pelo site dos Correios ou Melhor Envio.</p>
   `;
 
-  const mail = {
-    from: `"Carlton" <${EMAIL_USER}>`,
+  const bcc = EMAIL_TO ? EMAIL_TO : undefined;
+
+  const ok = await sendEmail({
     to: pedido.email_cliente,
+    bcc,
     subject: `Código de Rastreio - Pedido #${pedido.id}`,
     html: emailBody,
-  };
+  });
 
-  if (EMAIL_TO) {
-    mail.bcc = EMAIL_TO;
-  }
-
-  return sendMailSafe(mail, 'MAIL/TRACK', { pedidoId: pedido.id });
+  log(ok ? 'info' : 'warn', 'MAIL/TRACK', ok ? 'E-mail de rastreio enviado' : 'Falha ao enviar e-mail de rastreio', { pedidoId: pedido.id });
 }
 
-// FUNÇÃO: ENVIAR E-MAIL DE EXPIRAÇÃO DE PIX
+// EXPIRAÇÃO
 async function enviarEmailDeExpiracao(pedido) {
   const emailBody = `
     <h1>⚠️ Pagamento não confirmado para o Pedido #${pedido.id}</h1>
@@ -691,28 +569,23 @@ async function enviarEmailDeExpiracao(pedido) {
     <p>O link para pagamento via PIX expirou para evitar pagamentos duplicados ou fraudes. Se ainda deseja adquirir os produtos, por favor, realize um novo pedido em nosso site.</p>
     <p>Se você já pagou e acha que isso foi um engano, por favor, entre em contato conosco com o comprovante de pagamento.</p>
     <hr>
-    <p>Agradecemos a sua compreensão.</p>
     <p>Atenciosamente,</p>
     <p>Equipe Carlton</p>
   `;
 
-  const mail = {
-    from: `"Carlton" <${EMAIL_USER}>`,
+  const bcc = EMAIL_TO ? EMAIL_TO : undefined;
+
+  const ok = await sendEmail({
     to: pedido.email_cliente,
+    bcc,
     subject: `Aviso: Pagamento Pendente para o Pedido #${pedido.id}`,
     html: emailBody,
-  };
+  });
 
-  if (EMAIL_TO) {
-    mail.bcc = EMAIL_TO;
-  }
-
-  return sendMailSafe(mail, 'MAIL/EXPIRY', { pedidoId: pedido.id });
+  return ok;
 }
 
-// ------------------------
-// MELHOR ENVIO
-// ------------------------
+// ------------------- MELHOR ENVIO -------------------
 
 // FUNÇÃO: INSERIR PEDIDO NO CARRINHO DO MELHOR ENVIO
 async function inserirPedidoNoCarrinhoME(pedido) {
@@ -726,32 +599,18 @@ async function inserirPedidoNoCarrinhoME(pedido) {
   const payload = {
     service: frete.code,
     from: {
-      name: SENDER_NAME,
-      phone: SENDER_PHONE.replace(/\D/g, ''),
-      email: SENDER_EMAIL,
-      document: SENDER_DOCUMENT.replace(/\D/g, ''),
-      address: SENDER_STREET,
-      complement: SENDER_COMPLEMENT,
-      number: SENDER_NUMBER,
-      district: SENDER_DISTRICT,
-      city: SENDER_CITY,
-      state_abbr: SENDER_STATE_ABBR,
-      country_id: "BR",
+      name: SENDER_NAME, phone: SENDER_PHONE.replace(/\D/g, ''), email: SENDER_EMAIL,
+      document: SENDER_DOCUMENT.replace(/\D/g, ''), address: SENDER_STREET,
+      complement: SENDER_COMPLEMENT, number: SENDER_NUMBER, district: SENDER_DISTRICT,
+      city: SENDER_CITY, state_abbr: SENDER_STATE_ABBR, country_id: "BR",
       postal_code: SENDER_CEP.replace(/\D/g, ''),
     },
     to: {
-      name: pedido.nome_cliente,
-      phone: pedido.telefone_cliente.replace(/\D/g, ''),
-      email: pedido.email_cliente,
-      document: pedido.cpf_cliente.replace(/\D/g, ''),
-      address: pedido.logradouro,
-      complement: pedido.complemento,
-      number: pedido.numero,
-      district: pedido.bairro,
-      city: pedido.cidade,
-      state_abbr: pedido.estado,
-      country_id: "BR",
-      postal_code: pedido.cep.replace(/\D/g, ''),
+      name: pedido.nome_cliente, phone: pedido.telefone_cliente.replace(/\D/g, ''),
+      email: pedido.email_cliente, document: pedido.cpf_cliente.replace(/\D/g, ''),
+      address: pedido.logradouro, complement: pedido.complemento, number: pedido.numero,
+      district: pedido.bairro, city: pedido.cidade, state_abbr: pedido.estado,
+      country_id: "BR", postal_code: pedido.cep.replace(/\D/g, ''),
     },
     products: itens.map(item => ({
       name: item.title || item.id,
@@ -781,8 +640,7 @@ async function inserirPedidoNoCarrinhoME(pedido) {
   const response = await fetch('https://www.melhorenvio.com.br/api/v2/me/cart', {
     method: 'POST',
     headers: {
-      'Accept': 'application/json',
-      'Content-Type': 'application/json',
+      'Accept': 'application/json', 'Content-Type': 'application/json',
       'Authorization': `Bearer ${MELHOR_ENVIO_TOKEN}`,
       'User-Agent': 'Carlton (carltoncoletivo@audionoiseskatevisual.com)'
     },
@@ -791,10 +649,7 @@ async function inserirPedidoNoCarrinhoME(pedido) {
 
   const data = await response.json();
   if (!response.ok) {
-    log('error', 'ME/CART/ERROR', 'Erro ao inserir no carrinho do Melhor Envio', {
-      status: response.status,
-      response: data
-    });
+    log('error', 'ME/CART/ERROR', 'Erro ao inserir no carrinho do Melhor Envio', { status: response.status, response: data });
     console.error("Payload enviado para o Melhor Envio:", JSON.stringify(payload, null, 2));
     console.error("Resposta de erro do Melhor Envio:", data);
     throw new Error(JSON.stringify(data.error || 'Erro ao inserir no carrinho Melhor Envio.'));
@@ -802,15 +657,8 @@ async function inserirPedidoNoCarrinhoME(pedido) {
 
   const melhorEnvioId = data.id;
   if (melhorEnvioId) {
-    await db.query(
-      "UPDATE pedidos SET melhor_envio_id = ? WHERE id = ?",
-      [melhorEnvioId, pedido.id]
-    );
-
-    log('info', 'ME/CART/OK', 'ID do Melhor Envio salvo no pedido', {
-      pedidoId: pedido.id,
-      melhorEnvioId
-    });
+    await db.query("UPDATE pedidos SET melhor_envio_id = ? WHERE id = ?", [melhorEnvioId, pedido.id]);
+    log('info', 'ME/CART/OK', 'ID do Melhor Envio salvo no pedido', { pedidoId: pedido.id, melhorEnvioId });
   }
 
   log('info', 'ME/CART/OK', 'Pedido inserido no carrinho do Melhor Envio', { pedidoId: pedido.id });
@@ -820,10 +668,7 @@ async function inserirPedidoNoCarrinhoME(pedido) {
 app.post('/rastrear-pedido', async (req, res) => {
   const { cpf, email } = req.body;
 
-  log('info', 'API/RASTREIO/IN', 'Solicitação recebida', {
-    hasCpf: !!cpf,
-    hasEmail: !!email
-  });
+  log('info', 'API/RASTREIO/IN', 'Solicitação recebida', { hasCpf: !!cpf, hasEmail: !!email });
 
   if (!cpf || !email) {
     log('warn', 'API/RASTREIO/INVALID', 'CPF e e-mail são obrigatórios');
@@ -874,15 +719,12 @@ app.post('/rastrear-pedido', async (req, res) => {
       id: pedidoDoBanco.id,
       status: pedidoDoBanco.status,
       codigo_rastreio: pedidoDoBanco.codigo_rastreio,
-
       data_pagamento: null,
       data_producao: null,
       data_envio: null,
       data_entrega: null,
       data_prevista_entrega: null,
-
       cliente: { nome: pedidoDoBanco.nome_cliente },
-
       endereco_entrega: {
         rua: `${pedidoDoBanco.logradouro}, ${pedidoDoBanco.numero}`,
         bairro: pedidoDoBanco.bairro,
@@ -890,29 +732,19 @@ app.post('/rastrear-pedido', async (req, res) => {
         estado: pedidoDoBanco.estado,
         cep: pedidoDoBanco.cep,
       },
-
       itens: itensFormatados,
-
       pagamento: {
         metodo: pedidoDoBanco.metodo_pagamento || 'Não informado',
         final_cartao: pedidoDoBanco.final_cartao ? `**** **** **** ${pedidoDoBanco.final_cartao}` : null,
       },
-
       frete: parseFloat(freteInfo.price || 0)
     };
 
-    log('info', 'API/RASTREIO/OK', 'Pedido encontrado e enviado ao frontend', {
-      pedidoId: pedidoDoBanco.id,
-      status: pedidoDoBanco.status
-    });
+    log('info', 'API/RASTREIO/OK', 'Pedido encontrado e enviado ao frontend', { pedidoId: pedidoDoBanco.id, status: pedidoDoBanco.status });
 
     res.status(200).json(dadosFormatadosParaFrontend);
-
   } catch (error) {
-    log('error', 'API/RASTREIO/ERROR', 'Erro ao buscar pedido pelo CPF', {
-      message: error?.message,
-      stack: error?.stack
-    });
+    log('error', 'API/RASTREIO/ERROR', 'Erro ao buscar pedido pelo CPF', { message: error?.message, stack: error?.stack });
     res.status(500).json({ error: 'Ocorreu um erro interno. Por favor, tente mais tarde.' });
   }
 });
