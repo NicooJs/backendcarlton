@@ -18,12 +18,14 @@ const port = process.env.PORT || 4000;
 app.use(cors());
 
 // A body-parser precisa ser configurada com `verify` para ler o buffer da requisição,
-// que é necessário para validar a assinatura do webhook.
-app.use(express.json({
-  verify: (req, res, buf) => {
-    req.rawBody = buf;
-  }
-}));
+// que é necessário em algumas validações. (Aqui a assinatura do MP usa headers+query.)
+app.use(
+  express.json({
+    verify: (req, res, buf) => {
+      req.rawBody = buf;
+    },
+  })
+);
 
 // ------------------------
 // LOGGING (somente logs)
@@ -47,7 +49,10 @@ const log = (level, scope, message, meta) => {
 
 // --- VARIÁVEIS DE AMBIENTE ---
 const {
-  MP_ACCESS_TOKEN, MELHOR_ENVIO_TOKEN, SENDER_CEP, BACKEND_URL,
+  MP_ACCESS_TOKEN,
+  MELHOR_ENVIO_TOKEN,
+  SENDER_CEP,
+  BACKEND_URL,
   FRONTEND_URL,
 
   // Email (Resend)
@@ -59,12 +64,19 @@ const {
   CRON_SECRET,
 
   // Dados remetente Melhor Envio
-  SENDER_NAME, SENDER_PHONE, SENDER_EMAIL,
-  SENDER_DOCUMENT, SENDER_STREET, SENDER_NUMBER, SENDER_COMPLEMENT,
-  SENDER_DISTRICT, SENDER_CITY, SENDER_STATE_ABBR,
+  SENDER_NAME,
+  SENDER_PHONE,
+  SENDER_EMAIL,
+  SENDER_DOCUMENT,
+  SENDER_STREET,
+  SENDER_NUMBER,
+  SENDER_COMPLEMENT,
+  SENDER_DISTRICT,
+  SENDER_CITY,
+  SENDER_STATE_ABBR,
 
   // Webhook MP
-  MP_WEBHOOK_SECRET
+  MP_WEBHOOK_SECRET,
 } = process.env;
 
 // Validação das variáveis de ambiente (mantém seu contrato de não quebrar fluxo)
@@ -115,24 +127,41 @@ const parseXSignature = (raw) => {
   return out;
 };
 
-// Validação webhook MP (segue seu padrão, mas com trim/robustez)
+const getHeader = (req, name) => {
+  const v = req.headers?.[name.toLowerCase()];
+  return v === undefined ? null : String(v);
+};
+
+// ✅ Validação webhook MP (corrigida: inclui x-request-id no manifest)
 const validateMpWebhook = (req) => {
   if (!MP_WEBHOOK_SECRET) return { ok: true, reason: 'disabled' };
 
-  const signature = req.headers['x-signature'];
+  const signature = getHeader(req, 'x-signature');
+  const requestId = getHeader(req, 'x-request-id');
+
   if (!signature) return { ok: false, reason: 'missing_signature' };
+  if (!requestId) return { ok: false, reason: 'missing_request_id' };
 
   const { ts, v1 } = parseXSignature(signature);
   if (!ts || !v1) return { ok: false, reason: 'bad_signature_format' };
 
-  const id = req.query.id || req.query['data.id'];
+  const id = req.query?.id || req.query?.['data.id'];
   if (!id) return { ok: false, reason: 'missing_id' };
 
-  // Mantém a string que você já usava (sem quebrar), só deixando mais “resistente”
-  const message = `id:${String(id).trim()};ts:${String(ts).trim()};`;
-  const expected = crypto.createHmac('sha256', MP_WEBHOOK_SECRET).update(message).digest('hex');
+  // Manifest conforme documentação do MP: id + request-id + ts
+  const manifest = `id:${String(id).trim()};request-id:${String(requestId).trim()};ts:${String(ts).trim()};`;
+  const expectedHex = crypto.createHmac('sha256', MP_WEBHOOK_SECRET).update(manifest).digest('hex');
 
-  return { ok: expected === v1, reason: expected === v1 ? 'ok' : 'invalid_signature' };
+  // Comparação timing-safe (evita timing leak)
+  try {
+    const expected = Buffer.from(expectedHex, 'hex');
+    const received = Buffer.from(String(v1).trim(), 'hex');
+    if (expected.length !== received.length) return { ok: false, reason: 'invalid_signature' };
+    const ok = crypto.timingSafeEqual(expected, received);
+    return { ok, reason: ok ? 'ok' : 'invalid_signature' };
+  } catch {
+    return { ok: false, reason: 'invalid_signature' };
+  }
 };
 
 // Email sender (Resend)
@@ -151,19 +180,20 @@ async function sendEmail({ to, subject, html, bcc }) {
       from: EMAIL_FROM,
       to: Array.isArray(to) ? to : [to],
       subject,
-      html
+      html,
     };
     if (bcc) payload.bcc = Array.isArray(bcc) ? bcc : [bcc];
-const getFromDomain = (fromStr = '') => {
-  const m = fromStr.match(/<([^>]+)>/);
-  const email = (m ? m[1] : fromStr).trim();
-  return email.split('@')[1] || null;
-};
 
-log('info', 'MAIL/DEBUG', 'Sending with FROM domain', {
-  domain: getFromDomain(EMAIL_FROM),
-  hasFrom: !!EMAIL_FROM
-});
+    const getFromDomain = (fromStr = '') => {
+      const m = fromStr.match(/<([^>]+)>/);
+      const email = (m ? m[1] : fromStr).trim();
+      return email.split('@')[1] || null;
+    };
+
+    log('info', 'MAIL/DEBUG', 'Sending with FROM domain', {
+      domain: getFromDomain(EMAIL_FROM),
+      hasFrom: !!EMAIL_FROM,
+    });
 
     const { data, error } = await resend.emails.send(payload);
 
@@ -175,7 +205,10 @@ log('info', 'MAIL/DEBUG', 'Sending with FROM domain', {
     log('info', 'MAIL/SEND/OK', 'Email enviado via Resend', { id: data?.id, to: payload.to, subject });
     return { ok: true, id: data?.id };
   } catch (err) {
-    log('error', 'MAIL/SEND/FATAL', 'Falha inesperada ao enviar via Resend', { message: err?.message, stack: err?.stack });
+    log('error', 'MAIL/SEND/FATAL', 'Falha inesperada ao enviar via Resend', {
+      message: err?.message,
+      stack: err?.stack,
+    });
     return { ok: false, reason: 'exception', error: err?.message };
   }
 }
@@ -192,7 +225,6 @@ app.get('/test-email', async (req, res) => {
 
   const result = await sendEmail({
     to,
-    // opcional: manda cópia pro admin se você quiser sempre
     bcc: EMAIL_TO && EMAIL_TO !== to ? EMAIL_TO : undefined,
     subject: '✅ Teste de Email — CARLTON',
     html: `
@@ -203,11 +235,10 @@ app.get('/test-email', async (req, res) => {
         <hr style="margin:16px 0;" />
         <p style="margin:0;">CARLTON</p>
       </div>
-    `
+    `,
   });
 
   if (!result.ok) return res.status(500).json({ ok: false, result });
-
   return res.status(200).json({ ok: true, id: result.id, to });
 });
 
@@ -220,7 +251,7 @@ app.post('/criar-preferencia', async (req, res) => {
       itemsCount: Array.isArray(items) ? items.length : 0,
       hasCustomerInfo: !!customerInfo,
       hasSelectedShipping: !!selectedShipping,
-      shipmentCostDefined: shipmentCost !== undefined
+      shipmentCostDefined: shipmentCost !== undefined,
     });
 
     if (!items || !customerInfo || !selectedShipping || shipmentCost === undefined) {
@@ -229,7 +260,9 @@ app.post('/criar-preferencia', async (req, res) => {
     }
 
     const total = items.reduce((sum, item) => sum + item.unit_price * item.quantity, 0) + shipmentCost;
-    const fullAddress = `${customerInfo.address}, ${customerInfo.number} ${customerInfo.complement || ''} - ${customerInfo.neighborhood}, ${customerInfo.city}/${customerInfo.state}, CEP: ${customerInfo.cep}`;
+    const fullAddress = `${customerInfo.address}, ${customerInfo.number} ${customerInfo.complement || ''} - ${
+      customerInfo.neighborhood
+    }, ${customerInfo.city}/${customerInfo.state}, CEP: ${customerInfo.cep}`;
 
     const sql = `INSERT INTO pedidos (
             nome_cliente, email_cliente, cpf_cliente, telefone_cliente, 
@@ -237,20 +270,33 @@ app.post('/criar-preferencia', async (req, res) => {
             itens_pedido, info_frete, valor_total, status, expiracao_pix
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'AGUARDANDO_PAGAMENTO', ?);`;
 
-    const expiracaoPix = new Date(Date.now() + 30 * 60 * 1000);
+    // ✅ Unifica a expiração do Pix com a expiração da preferência do MP (estabilidade e consistência)
+    const EXPIRACAO_MINUTOS = 60; // (antes: 30 no banco e 60 na preferência)
+    const expiracaoPix = new Date(Date.now() + EXPIRACAO_MINUTOS * 60 * 1000);
 
     const [result] = await db.query(sql, [
-      `${customerInfo.firstName} ${customerInfo.lastName}`, customerInfo.email,
-      customerInfo.cpf.replace(/\D/g, ''), customerInfo.phone.replace(/\D/g, ''),
-      fullAddress, customerInfo.cep.replace(/\D/g, ''), customerInfo.address,
-      customerInfo.number, customerInfo.complement, customerInfo.neighborhood,
-      customerInfo.city, customerInfo.state, JSON.stringify(items),
-      JSON.stringify(selectedShipping), total, expiracaoPix
+      `${customerInfo.firstName} ${customerInfo.lastName}`,
+      customerInfo.email,
+      customerInfo.cpf.replace(/\D/g, ''),
+      customerInfo.phone.replace(/\D/g, ''),
+      fullAddress,
+      customerInfo.cep.replace(/\D/g, ''),
+      customerInfo.address,
+      customerInfo.number,
+      customerInfo.complement,
+      customerInfo.neighborhood,
+      customerInfo.city,
+      customerInfo.state,
+      JSON.stringify(items),
+      JSON.stringify(selectedShipping),
+      total,
+      expiracaoPix,
     ]);
+
     const novoPedidoId = result.insertId;
 
     const now = new Date();
-    const expiresAt = new Date(now.getTime() + 60 * 60 * 1000).toISOString();
+    const expiresAt = new Date(now.getTime() + EXPIRACAO_MINUTOS * 60 * 1000).toISOString();
 
     const preferenceBody = {
       items,
@@ -261,11 +307,11 @@ app.post('/criar-preferencia', async (req, res) => {
       back_urls: {
         success: `${FRONTEND_URL}/sucesso`,
         failure: `${FRONTEND_URL}/falha`,
-        pending: `${FRONTEND_URL}/pendente`
+        pending: `${FRONTEND_URL}/pendente`,
       },
       expires: true,
       expiration_date_from: now.toISOString(),
-      expiration_date_to: expiresAt
+      expiration_date_to: expiresAt,
     };
 
     const preference = new Preference(client);
@@ -274,14 +320,14 @@ app.post('/criar-preferencia', async (req, res) => {
     log('info', 'API/PREF/OK', 'Pedido salvo e preferência criada', {
       pedidoId: novoPedidoId,
       preferenceId: preferenceResult.id,
-      total: Number(total)
+      total: Number(total),
     });
 
     res.status(201).json({ id: preferenceResult.id, init_point: preferenceResult.init_point });
   } catch (error) {
     log('error', 'API/PREF/ERROR', 'Erro ao criar preferência e salvar pedido', {
       message: error?.message,
-      stack: error?.stack
+      stack: error?.stack,
     });
     res.status(500).json({ error: 'Erro interno ao processar o pedido.' });
   }
@@ -293,7 +339,7 @@ app.post('/calcular-frete', async (req, res) => {
 
   log('info', 'API/FRETE/IN', 'Requisição recebida', {
     hasCepDestino: !!cepDestino,
-    itemsCount: Array.isArray(items) ? items.length : 0
+    itemsCount: Array.isArray(items) ? items.length : 0,
   });
 
   if (!cepDestino || !items || items.length === 0) {
@@ -312,52 +358,54 @@ app.post('/calcular-frete', async (req, res) => {
       try {
         const viaCepResponse = await fetch(viaCepUrl);
         addressInfo = await viaCepResponse.json();
-        if (addressInfo.erro) throw new Error("CEP de destino não encontrado.");
+        if (addressInfo.erro) throw new Error('CEP de destino não encontrado.');
         break;
       } catch (error) {
         attempts++;
         if (attempts === maxAttempts) {
           log('error', 'API/FRETE/VIACEP_FATAL', 'Falha ao consultar ViaCEP após tentativas', {
             attempts,
-            message: error?.message
+            message: error?.message,
           });
-          throw new Error('Não foi possível conectar com o serviço de CEP no momento. Por favor, tente novamente mais tarde.');
+          throw new Error(
+            'Não foi possível conectar com o serviço de CEP no momento. Por favor, tente novamente mais tarde.'
+          );
         }
         log('warn', 'API/FRETE/VIACEP_RETRY', 'Tentativa ViaCEP falhou. Tentando novamente...', { attempts });
-        await new Promise(resolve => setTimeout(resolve, 1000 * attempts));
+        await new Promise((resolve) => setTimeout(resolve, 1000 * attempts));
       }
     }
 
-    const subtotal = items.reduce((sum, item) => sum + (item.unit_price * item.quantity), 0);
+    const subtotal = items.reduce((sum, item) => sum + item.unit_price * item.quantity, 0);
 
     const shipmentPayload = {
       from: { postal_code: SENDER_CEP.replace(/\D/g, '') },
       to: { postal_code: cleanCepDestino },
-      products: items.map(item => ({
+      products: items.map((item) => ({
         name: item.title || item.id,
         quantity: item.quantity,
         unitary_value: item.unit_price,
         height: 10,
         width: 15,
         length: 20,
-        weight: 0.3
+        weight: 0.3,
       })),
       options: {
         receipt: false,
         own_hand: false,
-        insurance_value: subtotal
-      }
+        insurance_value: subtotal,
+      },
     };
 
     const meResponse = await fetch('https://www.melhorenvio.com.br/api/v2/me/shipment/calculate', {
       method: 'POST',
       headers: {
-        'Accept': 'application/json',
+        Accept: 'application/json',
         'Content-Type': 'application/json',
-        'Authorization': `Bearer ${MELHOR_ENVIO_TOKEN}`,
-        'User-Agent': 'Carlton (carltoncoletivo@audionoiseskatevisual.com)'
+        Authorization: `Bearer ${MELHOR_ENVIO_TOKEN}`,
+        'User-Agent': 'Carlton (carltoncoletivo@audionoiseskatevisual.com)',
       },
-      body: JSON.stringify(shipmentPayload)
+      body: JSON.stringify(shipmentPayload),
     });
 
     const responseData = await meResponse.json();
@@ -367,22 +415,22 @@ app.post('/calcular-frete', async (req, res) => {
     }
 
     const formattedServices = responseData
-      .filter(option => {
+      .filter((option) => {
         if (option.error) return false;
         const isSedex = option.company.name === 'Correios' && option.name === 'SEDEX';
         const isLoggi = option.company.name === 'Loggi';
         return isSedex || isLoggi;
       })
-      .map(option => ({
+      .map((option) => ({
         code: option.id,
         name: `${option.company.name} - ${option.name}`,
         price: parseFloat(option.price),
-        deliveryTime: option.delivery_time
+        deliveryTime: option.delivery_time,
       }));
 
     log('info', 'API/FRETE/OK', 'Fretes calculados', {
       cepDestino: cleanCepDestino,
-      servicesCount: formattedServices.length
+      servicesCount: formattedServices.length,
     });
 
     res.status(200).json({
@@ -391,8 +439,8 @@ app.post('/calcular-frete', async (req, res) => {
         logradouro: addressInfo.logradouro,
         bairro: addressInfo.bairro,
         localidade: addressInfo.localidade,
-        uf: addressInfo.uf
-      }
+        uf: addressInfo.uf,
+      },
     });
   } catch (error) {
     log('error', 'API/FRETE/ERROR', 'Erro ao calcular frete', { message: error?.message });
@@ -400,103 +448,147 @@ app.post('/calcular-frete', async (req, res) => {
   }
 });
 
+// ------------------- MERCADO PAGO WEBHOOK -------------------
+
 // ROTA DE WEBHOOK PARA NOTIFICAÇÕES DO MERCADO PAGO
 app.post('/notificacao-pagamento', async (req, res) => {
+  const topic = req.query.topic || req.query.type;
+  const paymentIdCandidate = req.query.id || req.query['data.id'];
+
+  // ✅ 1) Primeiro decide se você processa esse evento.
+  // Eventos que você não processa devem retornar 200 para não gerar retry infinito.
+  if (topic !== 'payment') {
+    log('info', 'MP/WEBHOOK/IGNORED', 'Notificação ignorada (topic não suportado)', {
+      topic,
+      id: paymentIdCandidate,
+      requestId: getHeader(req, 'x-request-id'),
+    });
+    return res.status(200).send('Ignored');
+  }
+
+  // ✅ 2) Agora valida a assinatura apenas do que você processa.
   const sig = validateMpWebhook(req);
   if (!sig.ok) {
     log('error', 'MP/WEBHOOK/SIG_INVALID', 'Assinatura inválida (bloqueado)', {
       reason: sig.reason,
-      id: req.query?.id,
-      topic: req.query?.topic || req.query?.type
+      id: paymentIdCandidate,
+      topic,
+      requestId: getHeader(req, 'x-request-id'),
     });
     return res.status(401).send('Invalid signature');
   }
 
-  const topic = req.query.topic || req.query.type;
-  const paymentIdCandidate = req.query.id || req.query['data.id'];
-
   log('info', 'MP/WEBHOOK/IN', 'Notificação recebida', {
     topic,
-    id: paymentIdCandidate
+    id: paymentIdCandidate,
+    requestId: getHeader(req, 'x-request-id'),
   });
 
-  if (topic === 'payment') {
-    try {
-      const paymentId = paymentIdCandidate;
-      const payment = await new Payment(client).get({ id: paymentId });
+  // ✅ 3) Processa o pagamento
+  try {
+    const paymentId = paymentIdCandidate;
+    if (!paymentId) {
+      log('warn', 'MP/WEBHOOK/MISSING_PAYMENT_ID', 'Webhook payment sem id/data.id', {
+        topic,
+        requestId: getHeader(req, 'x-request-id'),
+      });
+      return res.status(200).send('Ok');
+    }
 
-      if (payment && payment.external_reference) {
-        const pedidoId = payment.external_reference;
-        const [rows] = await db.query('SELECT * FROM pedidos WHERE id = ?', [pedidoId]);
+    const payment = await new Payment(client).get({ id: paymentId });
 
-        if (rows.length > 0) {
-          const pedidoDoBanco = rows[0];
+    if (!payment || !payment.external_reference) {
+      log('warn', 'MP/WEBHOOK/NO_REF', 'Payment sem external_reference', { paymentId });
+      return res.status(200).send('Ok');
+    }
 
-          // Evita processar novamente um pedido já pago ou em produção
-          if (pedidoDoBanco.status !== 'AGUARDANDO_PAGAMENTO' && pedidoDoBanco.status !== 'PAGAMENTO_PENDENTE') {
-            log('info', 'MP/IDEMPOTENT', 'Pedido já processado, ignorando', {
-              pedidoId,
-              status: pedidoDoBanco.status
-            });
-          } else {
-            const isApproved = payment.status === 'approved';
-            const novoStatus = isApproved ? 'EM_PRODUCAO' : 'PAGAMENTO_PENDENTE';
+    const pedidoId = payment.external_reference;
+    const [rows] = await db.query('SELECT * FROM pedidos WHERE id = ?', [pedidoId]);
 
-            if (isApproved) {
-              const metodoPagamento = payment.payment_type_id === 'credit_card' ? 'Cartão de Crédito' :
-                payment.payment_type_id === 'ticket' ? 'Boleto' :
-                  payment.payment_method_id === 'pix' ? 'PIX' :
-                    (payment.payment_method_id || 'Não especificado');
+    if (rows.length === 0) {
+      log('warn', 'MP/WEBHOOK/NO_ORDER', 'external_reference não encontrado no banco', { pedidoId });
+      return res.status(200).send('Ok');
+    }
 
-              const finalCartao = payment.card ? payment.card.last_four_digits : null;
+    const pedidoDoBanco = rows[0];
+    const isApproved = payment.status === 'approved';
+    const novoStatus = isApproved ? 'EM_PRODUCAO' : 'PAGAMENTO_PENDENTE';
 
-              const sql = `
-                                UPDATE pedidos 
-                                SET status = ?, mercado_pago_id = ?, metodo_pagamento = ?, final_cartao = ? 
-                                WHERE id = ?
-                            `;
+    // ✅ Idempotência forte: update condicional. Se não atualizou, não dispara e-mail nem Melhor Envio.
+    if (isApproved) {
+      const metodoPagamento =
+        payment.payment_type_id === 'credit_card'
+          ? 'Cartão de Crédito'
+          : payment.payment_type_id === 'ticket'
+          ? 'Boleto'
+          : payment.payment_method_id === 'pix'
+          ? 'PIX'
+          : payment.payment_method_id || 'Não especificado';
 
-              await db.query(sql, [novoStatus, payment.id, metodoPagamento, finalCartao, pedidoId]);
+      const finalCartao = payment.card ? payment.card.last_four_digits : null;
 
-              log('info', 'MP/PAGAMENTO/APROVADO', 'Pedido atualizado para EM_PRODUCAO', {
-                pedidoId,
-                paymentId: payment.id,
-                metodo: metodoPagamento
-              });
+      const sql = `
+        UPDATE pedidos
+        SET status = ?, mercado_pago_id = ?, metodo_pagamento = ?, final_cartao = ?
+        WHERE id = ? AND status IN ('AGUARDANDO_PAGAMENTO', 'PAGAMENTO_PENDENTE');
+      `;
 
-              await enviarEmailDeConfirmacao({ ...pedidoDoBanco, mercado_pago_id: payment.id });
-              await inserirPedidoNoCarrinhoME(pedidoDoBanco);
+      const [upd] = await db.query(sql, [novoStatus, payment.id, metodoPagamento, finalCartao, pedidoId]);
 
-            } else if (pedidoDoBanco.status !== novoStatus) {
-              await db.query(
-                "UPDATE pedidos SET status = ?, mercado_pago_id = ? WHERE id = ?",
-                [novoStatus, payment.id, pedidoId]
-              );
-
-              log('info', 'MP/PAGAMENTO/PENDENTE', 'Pedido atualizado para PAGAMENTO_PENDENTE', {
-                pedidoId,
-                paymentId: payment.id
-              });
-            }
-          }
-        } else {
-          log('warn', 'MP/WEBHOOK/NO_ORDER', 'external_reference não encontrado no banco', { pedidoId });
-        }
-      } else {
-        log('warn', 'MP/WEBHOOK/NO_REF', 'Payment sem external_reference', { paymentId: paymentIdCandidate });
+      if (upd.affectedRows === 0) {
+        log('info', 'MP/IDEMPOTENT', 'Pedido já estava processado (approved), ignorando disparos', {
+          pedidoId,
+          status: pedidoDoBanco.status,
+          paymentId: payment.id,
+        });
+        return res.status(200).send('Ok');
       }
-    } catch (error) {
-      log('error', 'MP/WEBHOOK/ERROR', 'Erro ao processar notificação', {
-        message: error?.message,
-        stack: error?.stack
+
+      log('info', 'MP/PAGAMENTO/APROVADO', 'Pedido atualizado para EM_PRODUCAO', {
+        pedidoId,
+        paymentId: payment.id,
+        metodo: metodoPagamento,
+      });
+
+      // Recarrega o pedido atualizado pra garantir dados consistentes no e-mail/ME
+      const [rows2] = await db.query('SELECT * FROM pedidos WHERE id = ?', [pedidoId]);
+      const pedidoAtualizado = rows2?.[0] || { ...pedidoDoBanco, mercado_pago_id: payment.id };
+
+      await enviarEmailDeConfirmacao(pedidoAtualizado);
+      await inserirPedidoNoCarrinhoME(pedidoAtualizado);
+    } else {
+      const [upd] = await db.query(
+        "UPDATE pedidos SET status = ?, mercado_pago_id = ? WHERE id = ? AND status = 'AGUARDANDO_PAGAMENTO';",
+        [novoStatus, payment.id, pedidoId]
+      );
+
+      if (upd.affectedRows === 0) {
+        log('info', 'MP/IDEMPOTENT', 'Pedido já não estava aguardando pagamento (pendente), ignorando', {
+          pedidoId,
+          status: pedidoDoBanco.status,
+          paymentId: payment.id,
+        });
+        return res.status(200).send('Ok');
+      }
+
+      log('info', 'MP/PAGAMENTO/PENDENTE', 'Pedido atualizado para PAGAMENTO_PENDENTE', {
+        pedidoId,
+        paymentId: payment.id,
       });
     }
-  } else {
-    log('info', 'MP/WEBHOOK/IGNORED', 'Notificação ignorada (topic não suportado)', { topic });
-  }
 
-  res.status(200).send('Notificação recebida');
+    return res.status(200).send('Ok');
+  } catch (error) {
+    log('error', 'MP/WEBHOOK/ERROR', 'Erro ao processar notificação', {
+      message: error?.message,
+      stack: error?.stack,
+    });
+    // ✅ Importante: retornar 200 evita que o MP "martelhe" em caso de erro interno não relacionado a assinatura.
+    return res.status(200).send('Ok');
+  }
 });
+
+// ------------------- MELHOR ENVIO WEBHOOK -------------------
 
 // ROTA DE WEBHOOK DO MELHOR ENVIO PARA RASTREIO
 app.post('/webhook-melhorenvio', async (req, res) => {
@@ -505,9 +597,9 @@ app.post('/webhook-melhorenvio', async (req, res) => {
   try {
     const { resource, event } = req.body;
 
-    if (event === "tracking") {
-      const { id, tracking } = resource;
-      const [rows] = await db.query("SELECT * FROM pedidos WHERE melhor_envio_id = ?", [id]);
+    if (event === 'tracking') {
+      const { id, tracking } = resource || {};
+      const [rows] = await db.query('SELECT * FROM pedidos WHERE melhor_envio_id = ?', [id]);
 
       if (rows.length > 0 && tracking) {
         const pedido = rows[0];
@@ -518,29 +610,31 @@ app.post('/webhook-melhorenvio', async (req, res) => {
         log('info', 'ME/TRACKING/OK', 'Pedido atualizado para ENVIADO', {
           pedidoId: pedido.id,
           melhorEnvioId: id,
-          tracking
+          tracking,
         });
 
         await enviarEmailComRastreio(pedido, tracking);
       } else {
         log('warn', 'ME/TRACKING/NO_MATCH', 'Sem pedido para melhor_envio_id ou tracking ausente', {
           melhorEnvioId: id,
-          hasTracking: !!tracking
+          hasTracking: !!tracking,
         });
       }
     } else {
       log('info', 'ME/WEBHOOK/IGNORED', 'Evento ignorado', { event });
     }
 
-    res.status(200).send("Webhook do Melhor Envio processado com sucesso");
+    res.status(200).send('Webhook do Melhor Envio processado com sucesso');
   } catch (error) {
     log('error', 'ME/WEBHOOK/ERROR', 'Erro ao processar webhook Melhor Envio', {
       message: error?.message,
-      stack: error?.stack
+      stack: error?.stack,
     });
-    res.status(500).send("Erro no processamento do webhook");
+    res.status(500).send('Erro no processamento do webhook');
   }
 });
+
+// ------------------- CRON -------------------
 
 // ROTA PARA CHECAR PEDIDOS EXPIRADOS (cron)
 app.get('/checar-pedidos-expirados', async (req, res) => {
@@ -556,8 +650,9 @@ app.get('/checar-pedidos-expirados', async (req, res) => {
   log('info', 'CRON/EXPIRACAO/IN', 'Iniciando checagem de pedidos expirados.');
 
   try {
+    // ✅ Inclui também PAGAMENTO_PENDENTE para não deixar pedido preso
     const [pedidosExpirados] = await db.query(
-      "SELECT * FROM pedidos WHERE status = 'AGUARDANDO_PAGAMENTO' AND expiracao_pix < NOW();"
+      "SELECT * FROM pedidos WHERE status IN ('AGUARDANDO_PAGAMENTO','PAGAMENTO_PENDENTE') AND expiracao_pix < NOW();"
     );
 
     for (const pedido of pedidosExpirados) {
@@ -571,9 +666,9 @@ app.get('/checar-pedidos-expirados', async (req, res) => {
   } catch (error) {
     log('error', 'CRON/EXPIRACAO/ERROR', 'Erro ao checar pedidos expirados', {
       message: error?.message,
-      stack: error?.stack
+      stack: error?.stack,
     });
-    res.status(500).json({ error: "Erro interno na checagem de pedidos." });
+    res.status(500).json({ error: 'Erro interno na checagem de pedidos.' });
   }
 });
 
@@ -594,7 +689,9 @@ async function enviarEmailDeConfirmacao(pedido) {
         <hr>
         <h2>Detalhes do Pedido</h2>
         <ul>
-        ${itens.map(item => `<li>${item.quantity}x ${item.title} - R$ ${Number(item.unit_price).toFixed(2)} cada</li>`).join('')}
+        ${itens
+          .map((item) => `<li>${item.quantity}x ${item.title} - R$ ${Number(item.unit_price).toFixed(2)} cada</li>`)
+          .join('')}
         </ul>
         <hr>
         <h2>Valores</h2>
@@ -603,9 +700,7 @@ async function enviarEmailDeConfirmacao(pedido) {
     `;
 
   const result = await sendEmail({
-    // Cliente recebe
     to: pedido.email_cliente,
-    // Admin recebe cópia (se setado)
     bcc: EMAIL_TO || undefined,
     subject: `Confirmação do Pedido #${pedido.id}`,
     html: emailBody,
@@ -679,39 +774,55 @@ async function inserirPedidoNoCarrinhoME(pedido) {
   const itens = typeof pedido.itens_pedido === 'string' ? JSON.parse(pedido.itens_pedido) : pedido.itens_pedido;
   const frete = typeof pedido.info_frete === 'string' ? JSON.parse(pedido.info_frete) : pedido.info_frete;
   const subtotal = itens.reduce((sum, item) => sum + item.unit_price * item.quantity, 0);
-  const pesoTotal = itens.reduce((sum, item) => sum + (0.3 * item.quantity), 0);
+  const pesoTotal = itens.reduce((sum, item) => sum + 0.3 * item.quantity, 0);
 
   const payload = {
     service: frete.code,
     from: {
-      name: SENDER_NAME, phone: SENDER_PHONE.replace(/\D/g, ''), email: SENDER_EMAIL,
-      document: SENDER_DOCUMENT.replace(/\D/g, ''), address: SENDER_STREET,
-      complement: SENDER_COMPLEMENT, number: SENDER_NUMBER, district: SENDER_DISTRICT,
-      city: SENDER_CITY, state_abbr: SENDER_STATE_ABBR, country_id: "BR",
+      name: SENDER_NAME,
+      phone: SENDER_PHONE.replace(/\D/g, ''),
+      email: SENDER_EMAIL,
+      document: SENDER_DOCUMENT.replace(/\D/g, ''),
+      address: SENDER_STREET,
+      complement: SENDER_COMPLEMENT,
+      number: SENDER_NUMBER,
+      district: SENDER_DISTRICT,
+      city: SENDER_CITY,
+      state_abbr: SENDER_STATE_ABBR,
+      country_id: 'BR',
       postal_code: SENDER_CEP.replace(/\D/g, ''),
     },
     to: {
-      name: pedido.nome_cliente, phone: pedido.telefone_cliente.replace(/\D/g, ''),
-      email: pedido.email_cliente, document: pedido.cpf_cliente.replace(/\D/g, ''),
-      address: pedido.logradouro, complement: pedido.complemento, number: pedido.numero,
-      district: pedido.bairro, city: pedido.cidade, state_abbr: pedido.estado,
-      country_id: "BR", postal_code: pedido.cep.replace(/\D/g, ''),
+      name: pedido.nome_cliente,
+      phone: pedido.telefone_cliente.replace(/\D/g, ''),
+      email: pedido.email_cliente,
+      document: pedido.cpf_cliente.replace(/\D/g, ''),
+      address: pedido.logradouro,
+      complement: pedido.complemento,
+      number: pedido.numero,
+      district: pedido.bairro,
+      city: pedido.cidade,
+      state_abbr: pedido.estado,
+      country_id: 'BR',
+      postal_code: pedido.cep.replace(/\D/g, ''),
     },
-    products: itens.map(item => ({
+    products: itens.map((item) => ({
       name: item.title || item.id,
       quantity: item.quantity,
       unitary_value: item.unit_price,
       height: 10,
       width: 15,
       length: 20,
-      weight: 0.3
+      weight: 0.3,
     })),
-    volumes: [{
-      height: 10,
-      width: 15,
-      length: 20,
-      weight: pesoTotal < 0.01 ? 0.01 : pesoTotal
-    }],
+    volumes: [
+      {
+        height: 10,
+        width: 15,
+        length: 20,
+        weight: pesoTotal < 0.01 ? 0.01 : pesoTotal,
+      },
+    ],
     options: {
       insurance_value: Math.max(1, subtotal),
       receipt: false,
@@ -725,34 +836,32 @@ async function inserirPedidoNoCarrinhoME(pedido) {
   const response = await fetch('https://www.melhorenvio.com.br/api/v2/me/cart', {
     method: 'POST',
     headers: {
-      'Accept': 'application/json', 'Content-Type': 'application/json',
-      'Authorization': `Bearer ${MELHOR_ENVIO_TOKEN}`,
-      'User-Agent': 'Carlton (carltoncoletivo@audionoiseskatevisual.com)'
+      Accept: 'application/json',
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${MELHOR_ENVIO_TOKEN}`,
+      'User-Agent': 'Carlton (carltoncoletivo@audionoiseskatevisual.com)',
     },
-    body: JSON.stringify(payload)
+    body: JSON.stringify(payload),
   });
 
   const data = await response.json();
   if (!response.ok) {
     log('error', 'ME/CART/ERROR', 'Erro ao inserir no carrinho do Melhor Envio', {
       status: response.status,
-      response: data
+      response: data,
     });
-    console.error("Payload enviado para o Melhor Envio:", JSON.stringify(payload, null, 2));
-    console.error("Resposta de erro do Melhor Envio:", data);
+    console.error('Payload enviado para o Melhor Envio:', JSON.stringify(payload, null, 2));
+    console.error('Resposta de erro do Melhor Envio:', data);
     throw new Error(JSON.stringify(data.error || 'Erro ao inserir no carrinho Melhor Envio.'));
   }
 
   const melhorEnvioId = data.id;
   if (melhorEnvioId) {
-    await db.query(
-      "UPDATE pedidos SET melhor_envio_id = ? WHERE id = ?",
-      [melhorEnvioId, pedido.id]
-    );
+    await db.query('UPDATE pedidos SET melhor_envio_id = ? WHERE id = ?', [melhorEnvioId, pedido.id]);
 
     log('info', 'ME/CART/OK', 'ID do Melhor Envio salvo no pedido', {
       pedidoId: pedido.id,
-      melhorEnvioId
+      melhorEnvioId,
     });
   }
 
@@ -765,7 +874,7 @@ app.post('/rastrear-pedido', async (req, res) => {
 
   log('info', 'API/RASTREIO/IN', 'Solicitação recebida', {
     hasCpf: !!cpf,
-    hasEmail: !!email
+    hasEmail: !!email,
   });
 
   if (!cpf || !email) {
@@ -797,20 +906,16 @@ app.post('/rastrear-pedido', async (req, res) => {
 
     const pedidoDoBanco = rows[0];
 
-    const itens = typeof pedidoDoBanco.itens_pedido === 'string'
-      ? JSON.parse(pedidoDoBanco.itens_pedido)
-      : pedidoDoBanco.itens_pedido || [];
+    const itens = typeof pedidoDoBanco.itens_pedido === 'string' ? JSON.parse(pedidoDoBanco.itens_pedido) : pedidoDoBanco.itens_pedido || [];
 
-    const freteInfo = typeof pedidoDoBanco.info_frete === 'string'
-      ? JSON.parse(pedidoDoBanco.info_frete)
-      : pedidoDoBanco.info_frete || {};
+    const freteInfo = typeof pedidoDoBanco.info_frete === 'string' ? JSON.parse(pedidoDoBanco.info_frete) : pedidoDoBanco.info_frete || {};
 
-    const itensFormatados = itens.map(item => ({
+    const itensFormatados = itens.map((item) => ({
       id: item.id,
       nome: item.title,
       quantidade: item.quantity,
       preco: parseFloat(item.unit_price),
-      imagem: item.picture_url
+      imagem: item.picture_url,
     }));
 
     const dadosFormatadosParaFrontend = {
@@ -840,20 +945,19 @@ app.post('/rastrear-pedido', async (req, res) => {
         final_cartao: pedidoDoBanco.final_cartao ? `**** **** **** ${pedidoDoBanco.final_cartao}` : null,
       },
 
-      frete: parseFloat(freteInfo.price || 0)
+      frete: parseFloat(freteInfo.price || 0),
     };
 
     log('info', 'API/RASTREIO/OK', 'Pedido encontrado e enviado ao frontend', {
       pedidoId: pedidoDoBanco.id,
-      status: pedidoDoBanco.status
+      status: pedidoDoBanco.status,
     });
 
     res.status(200).json(dadosFormatadosParaFrontend);
-
   } catch (error) {
     log('error', 'API/RASTREIO/ERROR', 'Erro ao buscar pedido pelo CPF', {
       message: error?.message,
-      stack: error?.stack
+      stack: error?.stack,
     });
     res.status(500).json({ error: 'Ocorreu um erro interno. Por favor, tente mais tarde.' });
   }
