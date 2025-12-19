@@ -894,6 +894,44 @@ app.get('/checar-pedidos-expirados', async (req, res) => {
 });
 
 // ------------------- FUNÇÕES DE EMAIL (RESEND) -------------------
+// ------------------- PREVIEW DE EMAIL (DEV / TESTE) -------------------
+// ⚠️ Não envia email — apenas renderiza o HTML no navegador
+app.get('/preview-email', async (req, res) => {
+  try {
+    const type = String(req.query.type || 'confirm'); // confirm | tracking | expiry
+    const pedidoId = Number(req.query.pedidoId);
+    const trackingCode = String(req.query.tracking || 'BR123456789BR');
+
+    if (!pedidoId) {
+      return res.status(400).send('Informe ?pedidoId=NUMERO');
+    }
+
+    const [rows] = await db.query('SELECT * FROM pedidos WHERE id = ?', [pedidoId]);
+    if (!rows.length) {
+      return res.status(404).send('Pedido não encontrado');
+    }
+
+    const pedido = rows[0];
+
+    let payload;
+    if (type === 'tracking') {
+      payload = buildEmailHtml('tracking', pedido, { trackingCode });
+    } else if (type === 'expiry') {
+      payload = buildEmailHtml('expiry', pedido);
+    } else {
+      payload = buildEmailHtml('confirm', pedido);
+    }
+
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    return res.status(200).send(payload.html);
+  } catch (err) {
+    log('error', 'MAIL/PREVIEW/ERROR', 'Erro ao gerar preview', {
+      message: err?.message,
+      stack: err?.stack,
+    });
+    return res.status(500).send('Erro ao gerar preview do email');
+  }
+});
 async function enviarEmailDeConfirmacao(pedido) {
   const { subject, html } = buildEmail('confirm', pedido);
 
