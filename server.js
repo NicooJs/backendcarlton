@@ -154,6 +154,16 @@ async function sendEmail({ to, subject, html, bcc }) {
       html
     };
     if (bcc) payload.bcc = Array.isArray(bcc) ? bcc : [bcc];
+const getFromDomain = (fromStr = '') => {
+  const m = fromStr.match(/<([^>]+)>/);
+  const email = (m ? m[1] : fromStr).trim();
+  return email.split('@')[1] || null;
+};
+
+log('info', 'MAIL/DEBUG', 'Sending with FROM domain', {
+  domain: getFromDomain(EMAIL_FROM),
+  hasFrom: !!EMAIL_FROM
+});
 
     const { data, error } = await resend.emails.send(payload);
 
