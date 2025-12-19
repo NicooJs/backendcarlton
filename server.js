@@ -188,7 +188,47 @@ const EMAIL_COPY = {
   brand: 'CARLTON',
   footerNote: 'Enviado automaticamente — não compartilhe dados sensíveis por e-mail.',
   supportLine: 'Se você não reconhece este pedido, responda este e-mail ou contate nosso suporte.',
+const escapeHtml = (str = '') =>
+  String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#039;');
 
+const buildEmailHtml = ({ title, bodyHtml }) => `
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8" />
+</head>
+<body style="font-family: Arial, sans-serif; background:#f6f6f6; padding:20px;">
+  <table width="100%" cellpadding="0" cellspacing="0">
+    <tr>
+      <td align="center">
+        <table width="600" style="background:#fff;border-radius:12px;padding:20px;">
+          <tr>
+            <td style="background:#111;color:#fff;padding:16px;border-radius:8px;">
+              <h1 style="margin:0;font-size:20px;">${escapeHtml(title)}</h1>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding:20px;color:#111;">
+              ${bodyHtml}
+            </td>
+          </tr>
+          <tr>
+            <td style="padding:16px;color:#666;font-size:12px;">
+              © ${new Date().getFullYear()} CARLTON
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>
+`;
   confirm: {
     subject: (pedidoId) => `✅ Confirmação do Pedido #${pedidoId} — CARLTON`,
     title: (pedidoId) => `Pedido confirmado #${pedidoId}`,
@@ -200,6 +240,7 @@ const EMAIL_COPY = {
     ctaLabel: 'Acompanhar pedido',
     ctaUrl: () => `${FRONTEND_URL}/pedidos`,
   },
+  
 
   tracking: {
     subject: (pedidoId) => `📦 Rastreio do Pedido #${pedidoId} — CARLTON`,
@@ -937,7 +978,27 @@ async function enviarEmailDeConfirmacao(pedido) {
   else log('error', 'MAIL/CONFIRM/ERROR', 'Erro ao enviar e-mail de confirmação', { pedidoId: pedido.id, result });
 }
 
-async function enviarEmailComRastreio(pedido, trackingCode) {
+const copy = EMAIL_COPY.tracking;
+
+const bodyHtml = `
+  <p>${copy.intro(pedido.nome_cliente, pedido.id)}</p>
+
+  <div style="margin:16px 0;padding:12px;border:1px solid #ddd;border-radius:8px;">
+    <strong>${copy.trackingLabel}:</strong><br/>
+    <span style="font-size:18px;">${escapeHtml(trackingCode)}</span>
+  </div>
+
+  <a href="${copy.ctaUrl()}"
+     style="display:inline-block;margin-top:16px;padding:12px 16px;
+            background:#111;color:#fff;text-decoration:none;border-radius:8px;">
+    ${copy.ctaLabel}
+  </a>
+`;
+
+const html = buildEmailHtml({
+  title: copy.title(pedido.id),
+  bodyHtml,
+});
   const { subject, html } = buildEmailHtml('tracking', pedido, { trackingCode });
 
   const result = await sendEmail({
