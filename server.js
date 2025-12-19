@@ -164,6 +164,251 @@ const validateMpWebhook = (req) => {
   }
 };
 
+// ------------------------
+// EMAIL TEMPLATES (EDITÁVEL)
+// ------------------------
+// ✅ Onde editar os textos do e-mail depois:
+// 1) Aqui embaixo no objeto EMAIL_COPY
+// 2) E os trechos HTML no buildEmailHtml()
+
+const escapeHtml = (str = '') =>
+  String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#039;');
+
+const moneyBRL = (value) => {
+  const n = Number(value || 0);
+  return n.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' });
+};
+
+const EMAIL_COPY = {
+  brand: 'CARLTON',
+  footerNote: 'Enviado automaticamente — não compartilhe dados sensíveis por e-mail.',
+  supportLine: 'Se você não reconhece este pedido, responda este e-mail ou contate nosso suporte.',
+
+  confirm: {
+    subject: (pedidoId) => `✅ Confirmação do Pedido #${pedidoId} — CARLTON`,
+    title: (pedidoId) => `Pedido confirmado #${pedidoId}`,
+    intro: (nome) => `Olá, ${nome}. Seu pagamento foi aprovado ✅`,
+    payLabel: 'ID do Pagamento (Mercado Pago)',
+    itemsTitle: 'Itens do pedido',
+    addressTitle: 'Endereço de entrega',
+    totalsTitle: 'Valores',
+    ctaLabel: 'Acompanhar pedido',
+    ctaUrl: () => `${FRONTEND_URL}/pedidos`,
+  },
+
+  tracking: {
+    subject: (pedidoId) => `📦 Rastreio do Pedido #${pedidoId} — CARLTON`,
+    title: (pedidoId) => `Seu pedido foi enviado #${pedidoId}`,
+    intro: (nome, pedidoId) => `Olá, ${nome}! Seu pedido #${pedidoId} foi postado 📦`,
+    trackingLabel: 'Código de rastreio',
+    ctaLabel: 'Acompanhar pedido',
+    ctaUrl: () => `${FRONTEND_URL}/pedidos`,
+  },
+
+  expiry: {
+    subject: (pedidoId) => `⚠️ Pedido #${pedidoId} — pagamento não confirmado`,
+    title: (pedidoId) => `Pagamento não confirmado — Pedido #${pedidoId}`,
+    intro: (nome, pedidoId) => `Olá, ${nome}. Não identificamos a confirmação do pagamento do pedido #${pedidoId}.`,
+    message:
+      'O link do PIX expirou para evitar pagamentos duplicados. Se você ainda deseja adquirir os produtos, por favor realize um novo pedido em nosso site.',
+    ctaLabel: 'Voltar para a loja',
+    ctaUrl: () => `${FRONTEND_URL}`,
+  },
+};
+
+function emailLayout({ title, preheader, contentHtml }) {
+  const safeTitle = escapeHtml(title || EMAIL_COPY.brand);
+  const safePreheader = escapeHtml(preheader || '');
+
+  return `
+  <!doctype html>
+  <html lang="pt-BR">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>${safeTitle}</title>
+  </head>
+  <body style="margin:0;padding:0;background:#f6f6f6;">
+    <div style="display:none;max-height:0;overflow:hidden;opacity:0;color:transparent;">
+      ${safePreheader}
+    </div>
+
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#f6f6f6;padding:24px 0;">
+      <tr>
+        <td align="center">
+          <table role="presentation" width="600" cellpadding="0" cellspacing="0" style="width:600px;max-width:92vw;background:#ffffff;border-radius:14px;overflow:hidden;">
+            <tr>
+              <td style="padding:20px 22px;background:#111;color:#fff;font-family:Arial,sans-serif;">
+                <div style="font-size:14px;letter-spacing:.08em;">${escapeHtml(EMAIL_COPY.brand)}</div>
+                <div style="font-size:20px;font-weight:700;margin-top:6px;">${safeTitle}</div>
+              </td>
+            </tr>
+
+            <tr>
+              <td style="padding:22px;font-family:Arial,sans-serif;color:#111;font-size:14px;line-height:1.5;">
+                ${contentHtml}
+              </td>
+            </tr>
+
+            <tr>
+              <td style="padding:18px 22px;background:#fafafa;font-family:Arial,sans-serif;color:#555;font-size:12px;line-height:1.5;">
+                <div>${escapeHtml(EMAIL_COPY.supportLine)}</div>
+                <div style="margin-top:10px;">© ${new Date().getFullYear()} ${escapeHtml(EMAIL_COPY.brand)}</div>
+              </td>
+            </tr>
+          </table>
+
+          <div style="font-family:Arial,sans-serif;color:#888;font-size:12px;margin-top:12px;">
+            ${escapeHtml(EMAIL_COPY.footerNote)}
+          </div>
+        </td>
+      </tr>
+    </table>
+  </body>
+  </html>`;
+}
+
+function renderOrderItems(itens = []) {
+  if (!Array.isArray(itens) || itens.length === 0) return '<p><em>Sem itens.</em></p>';
+
+  const rows = itens
+    .map((item) => {
+      const qtd = Number(item.quantity || 0);
+      const title = escapeHtml(item.title || item.id || 'Item');
+      const unit = moneyBRL(item.unit_price);
+      const line = moneyBRL(Number(item.unit_price || 0) * qtd);
+
+      return `
+        <tr>
+          <td style="padding:10px 0;border-bottom:1px solid #eee;">
+            <div style="font-weight:600;">${title}</div>
+            <div style="color:#666;">${qtd}× ${unit}</div>
+          </td>
+          <td align="right" style="padding:10px 0;border-bottom:1px solid #eee;font-weight:600;">
+            ${line}
+          </td>
+        </tr>
+      `;
+    })
+    .join('');
+
+  return `
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;">
+      ${rows}
+    </table>
+  `;
+}
+
+function renderBlock(title, bodyHtml) {
+  return `
+    <div style="margin-top:14px;padding:14px;border:1px solid #eee;border-radius:12px;background:#fff;">
+      <div style="font-weight:700;margin-bottom:6px;">${escapeHtml(title)}</div>
+      <div style="color:#333;">${bodyHtml}</div>
+    </div>
+  `;
+}
+
+function renderTotals({ freteName, fretePrice, total }) {
+  const name = freteName ? ` (${escapeHtml(freteName)})` : '';
+  return `
+    <div style="margin-top:14px;padding:14px;border:1px solid #eee;border-radius:12px;background:#fff;">
+      <div style="display:flex;justify-content:space-between;margin-bottom:6px;">
+        <span style="color:#666;">Frete${name}</span>
+        <strong>${moneyBRL(fretePrice)}</strong>
+      </div>
+      <div style="display:flex;justify-content:space-between;font-size:16px;">
+        <span>Total</span>
+        <strong>${moneyBRL(total)}</strong>
+      </div>
+    </div>
+  `;
+}
+
+function renderButton({ label, url }) {
+  if (!url) return '';
+  return `
+    <div style="margin-top:16px;">
+      <a href="${escapeHtml(url)}"
+        style="display:inline-block;background:#111;color:#fff;text-decoration:none;padding:12px 16px;border-radius:10px;font-weight:700;">
+        ${escapeHtml(label || 'Ver')}
+      </a>
+    </div>
+  `;
+}
+
+function buildEmailHtml(type, pedido, extra = {}) {
+  // type: 'confirm' | 'tracking' | 'expiry'
+  const nome = escapeHtml(pedido?.nome_cliente || 'cliente');
+  const pedidoId = pedido?.id;
+
+  if (type === 'confirm') {
+    const itens = typeof pedido.itens_pedido === 'string' ? JSON.parse(pedido.itens_pedido) : pedido.itens_pedido || [];
+    const frete = typeof pedido.info_frete === 'string' ? JSON.parse(pedido.info_frete) : pedido.info_frete || {};
+
+    const title = EMAIL_COPY.confirm.title(pedidoId);
+    const preheader = `Pagamento aprovado — pedido #${pedidoId}.`;
+
+    const contentHtml = `
+      <p>${escapeHtml(EMAIL_COPY.confirm.intro(nome))}</p>
+      ${renderBlock(
+        'Resumo',
+        `
+          <div><strong>Pedido:</strong> #${escapeHtml(pedidoId)}</div>
+          <div><strong>${escapeHtml(EMAIL_COPY.confirm.payLabel)}:</strong> ${escapeHtml(pedido.mercado_pago_id || '')}</div>
+        `
+      )}
+      ${renderBlock(EMAIL_COPY.confirm.addressTitle, escapeHtml(pedido.endereco_entrega || ''))}
+      <div style="margin-top:16px;font-weight:700;">${escapeHtml(EMAIL_COPY.confirm.itemsTitle)}</div>
+      ${renderOrderItems(itens)}
+      ${renderTotals({ freteName: frete.name, fretePrice: frete.price, total: pedido.valor_total })}
+      ${renderButton({ label: EMAIL_COPY.confirm.ctaLabel, url: EMAIL_COPY.confirm.ctaUrl() })}
+    `;
+
+    return { subject: EMAIL_COPY.confirm.subject(pedidoId), html: emailLayout({ title, preheader, contentHtml }) };
+  }
+
+  if (type === 'tracking') {
+    const trackingCode = extra.trackingCode || '';
+    const title = EMAIL_COPY.tracking.title(pedidoId);
+    const preheader = `Rastreio: ${trackingCode}`;
+
+    const contentHtml = `
+      <p>${escapeHtml(EMAIL_COPY.tracking.intro(nome, pedidoId))}</p>
+      ${renderBlock(
+        EMAIL_COPY.tracking.trackingLabel,
+        `<div style="font-size:16px;"><strong>${escapeHtml(trackingCode)}</strong></div><div style="color:#666;margin-top:6px;">Acompanhe pelo site dos Correios / Melhor Envio.</div>`
+      )}
+      ${renderButton({ label: EMAIL_COPY.tracking.ctaLabel, url: EMAIL_COPY.tracking.ctaUrl() })}
+    `;
+
+    return { subject: EMAIL_COPY.tracking.subject(pedidoId), html: emailLayout({ title, preheader, contentHtml }) };
+  }
+
+  if (type === 'expiry') {
+    const title = EMAIL_COPY.expiry.title(pedidoId);
+    const preheader = `PIX expirou — pedido #${pedidoId}.`;
+
+    const contentHtml = `
+      <p>${escapeHtml(EMAIL_COPY.expiry.intro(nome, pedidoId))}</p>
+      ${renderBlock('Aviso', `<div>${escapeHtml(EMAIL_COPY.expiry.message)}</div>`)}
+      ${renderButton({ label: EMAIL_COPY.expiry.ctaLabel, url: EMAIL_COPY.expiry.ctaUrl() })}
+    `;
+
+    return { subject: EMAIL_COPY.expiry.subject(pedidoId), html: emailLayout({ title, preheader, contentHtml }) };
+  }
+
+  // fallback
+  return {
+    subject: `Mensagem — ${EMAIL_COPY.brand}`,
+    html: emailLayout({ title: `Mensagem`, preheader: '', contentHtml: `<p>Olá!</p>` }),
+  };
+}
+
 // Email sender (Resend)
 async function sendEmail({ to, subject, html, bcc }) {
   if (!resend) {
@@ -223,19 +468,23 @@ app.get('/test-email', async (req, res) => {
     return res.status(400).json({ error: 'Defina EMAIL_TO no Railway ou passe ?to=seuemail@...' });
   }
 
+  const html = emailLayout({
+    title: 'Teste de Email',
+    preheader: 'Se você recebeu isso, o envio via Railway (Resend) está OK.',
+    contentHtml: `
+      <p><strong>🔥 Email funcionando!</strong></p>
+      <p>Se você recebeu isso, o envio via Railway (Resend) está OK.</p>
+      <p><strong>Data:</strong> ${escapeHtml(new Date().toISOString())}</p>
+      <hr style="margin:16px 0;" />
+      <p>CARLTON</p>
+    `,
+  });
+
   const result = await sendEmail({
     to,
     bcc: EMAIL_TO && EMAIL_TO !== to ? EMAIL_TO : undefined,
     subject: '✅ Teste de Email — CARLTON',
-    html: `
-      <div style="font-family: Arial, sans-serif; color:#111;">
-        <h1 style="margin:0 0 12px;">🔥 Email funcionando!</h1>
-        <p style="margin:0 0 8px;">Se você recebeu isso, o envio via Railway (Resend) está OK.</p>
-        <p style="margin:0 0 8px;"><strong>Data:</strong> ${new Date().toISOString()}</p>
-        <hr style="margin:16px 0;" />
-        <p style="margin:0;">CARLTON</p>
-      </div>
-    `,
+    html,
   });
 
   if (!result.ok) return res.status(500).json({ ok: false, result });
@@ -260,18 +509,16 @@ app.post('/criar-preferencia', async (req, res) => {
     }
 
     const total = items.reduce((sum, item) => sum + item.unit_price * item.quantity, 0) + shipmentCost;
-    const fullAddress = `${customerInfo.address}, ${customerInfo.number} ${customerInfo.complement || ''} - ${
-      customerInfo.neighborhood
-    }, ${customerInfo.city}/${customerInfo.state}, CEP: ${customerInfo.cep}`;
+    const fullAddress = `${customerInfo.address}, ${customerInfo.number} ${customerInfo.complement || ''} - ${customerInfo.neighborhood}, ${customerInfo.city}/${customerInfo.state}, CEP: ${customerInfo.cep}`;
 
     const sql = `INSERT INTO pedidos (
-            nome_cliente, email_cliente, cpf_cliente, telefone_cliente, 
-            endereco_entrega, cep, logradouro, numero, complemento, bairro, cidade, estado,
-            itens_pedido, info_frete, valor_total, status, expiracao_pix
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'AGUARDANDO_PAGAMENTO', ?);`;
+      nome_cliente, email_cliente, cpf_cliente, telefone_cliente, 
+      endereco_entrega, cep, logradouro, numero, complemento, bairro, cidade, estado,
+      itens_pedido, info_frete, valor_total, status, expiracao_pix
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'AGUARDANDO_PAGAMENTO', ?);`;
 
-    // ✅ Unifica a expiração do Pix com a expiração da preferência do MP (estabilidade e consistência)
-    const EXPIRACAO_MINUTOS = 60; // (antes: 30 no banco e 60 na preferência)
+    // ✅ Unifica a expiração do Pix com a expiração da preferência do MP
+    const EXPIRACAO_MINUTOS = 60;
     const expiracaoPix = new Date(Date.now() + EXPIRACAO_MINUTOS * 60 * 1000);
 
     const [result] = await db.query(sql, [
@@ -348,7 +595,7 @@ app.post('/calcular-frete', async (req, res) => {
   }
 
   try {
-    const cleanCepDestino = cepDestino.replace(/\D/g, '');
+    const cleanCepDestino = String(cepDestino).replace(/\D/g, '');
     const viaCepUrl = `https://viacep.com.br/ws/${cleanCepDestino}/json/`;
     let addressInfo;
     let attempts = 0;
@@ -367,9 +614,7 @@ app.post('/calcular-frete', async (req, res) => {
             attempts,
             message: error?.message,
           });
-          throw new Error(
-            'Não foi possível conectar com o serviço de CEP no momento. Por favor, tente novamente mais tarde.'
-          );
+          throw new Error('Não foi possível conectar com o serviço de CEP no momento. Tente novamente mais tarde.');
         }
         log('warn', 'API/FRETE/VIACEP_RETRY', 'Tentativa ViaCEP falhou. Tentando novamente...', { attempts });
         await new Promise((resolve) => setTimeout(resolve, 1000 * attempts));
@@ -583,7 +828,7 @@ app.post('/notificacao-pagamento', async (req, res) => {
       message: error?.message,
       stack: error?.stack,
     });
-    // ✅ Importante: retornar 200 evita que o MP "martelhe" em caso de erro interno não relacionado a assinatura.
+    // ✅ Retornar 200 evita martelar em caso de erro interno não relacionado à assinatura.
     return res.status(200).send('Ok');
   }
 });
@@ -650,7 +895,7 @@ app.get('/checar-pedidos-expirados', async (req, res) => {
   log('info', 'CRON/EXPIRACAO/IN', 'Iniciando checagem de pedidos expirados.');
 
   try {
-    // ✅ Inclui também PAGAMENTO_PENDENTE para não deixar pedido preso
+    // ✅ Inclui também PAGAMENTO_PENDENTE
     const [pedidosExpirados] = await db.query(
       "SELECT * FROM pedidos WHERE status IN ('AGUARDANDO_PAGAMENTO','PAGAMENTO_PENDENTE') AND expiracao_pix < NOW();"
     );
@@ -674,95 +919,50 @@ app.get('/checar-pedidos-expirados', async (req, res) => {
 
 // ------------------- FUNÇÕES DE EMAIL (RESEND) -------------------
 
-// FUNÇÃO AUXILIAR DE ENVIO DE E-MAIL (CONFIRMAÇÃO)
+// ✅ Onde editar o texto depois:
+// - edite o objeto EMAIL_COPY (subjects, textos, botões)
+// - ou edite o HTML em buildEmailHtml()
+
 async function enviarEmailDeConfirmacao(pedido) {
-  const itens = typeof pedido.itens_pedido === 'string' ? JSON.parse(pedido.itens_pedido) : pedido.itens_pedido;
-  const frete = typeof pedido.info_frete === 'string' ? JSON.parse(pedido.info_frete) : pedido.info_frete;
-
-  const emailBody = `
-        <h1>🎉 Pedido Confirmado! (Nº ${pedido.id})</h1>
-        <p>Olá, ${pedido.nome_cliente}. Seu pagamento foi aprovado!</p>
-        <p><strong>ID do Pagamento (Mercado Pago):</strong> ${pedido.mercado_pago_id}</p>
-        <hr>
-        <h2>Endereço de Entrega</h2>
-        <p>${pedido.endereco_entrega}</p>
-        <hr>
-        <h2>Detalhes do Pedido</h2>
-        <ul>
-        ${itens
-          .map((item) => `<li>${item.quantity}x ${item.title} - R$ ${Number(item.unit_price).toFixed(2)} cada</li>`)
-          .join('')}
-        </ul>
-        <hr>
-        <h2>Valores</h2>
-        <p><strong>Frete (${frete.name}):</strong> R$ ${Number(frete.price).toFixed(2)}</p>
-        <h3><strong>Total:</strong> R$ ${Number(pedido.valor_total).toFixed(2)}</h3>
-    `;
+  const { subject, html } = buildEmailHtml('confirm', pedido);
 
   const result = await sendEmail({
     to: pedido.email_cliente,
     bcc: EMAIL_TO || undefined,
-    subject: `Confirmação do Pedido #${pedido.id}`,
-    html: emailBody,
+    subject,
+    html,
   });
 
-  if (result.ok) {
-    log('info', 'MAIL/CONFIRM/OK', 'E-mail de confirmação enviado', { pedidoId: pedido.id, id: result.id });
-  } else {
-    log('error', 'MAIL/CONFIRM/ERROR', 'Erro ao enviar e-mail de confirmação', { pedidoId: pedido.id, result });
-  }
+  if (result.ok) log('info', 'MAIL/CONFIRM/OK', 'E-mail de confirmação enviado', { pedidoId: pedido.id, id: result.id });
+  else log('error', 'MAIL/CONFIRM/ERROR', 'Erro ao enviar e-mail de confirmação', { pedidoId: pedido.id, result });
 }
 
-// FUNÇÃO: ENVIAR E-MAIL COM RASTREIO
 async function enviarEmailComRastreio(pedido, trackingCode) {
-  const emailBody = `
-        <h1>📦 Seu pedido foi postado!</h1>
-        <p>Olá, ${pedido.nome_cliente}.</p>
-        <p>Seu pedido <strong>#${pedido.id}</strong> já foi enviado.</p>
-        <p><strong>Código de rastreio:</strong> ${trackingCode}</p>
-        <p>Acompanhe pelo site dos Correios ou Melhor Envio.</p>
-    `;
+  const { subject, html } = buildEmailHtml('tracking', pedido, { trackingCode });
 
   const result = await sendEmail({
     to: pedido.email_cliente,
     bcc: EMAIL_TO || undefined,
-    subject: `Código de Rastreio - Pedido #${pedido.id}`,
-    html: emailBody,
+    subject,
+    html,
   });
 
-  if (result.ok) {
-    log('info', 'MAIL/TRACK/OK', 'E-mail de rastreio enviado', { pedidoId: pedido.id, id: result.id });
-  } else {
-    log('error', 'MAIL/TRACK/ERROR', 'Erro ao enviar e-mail de rastreio', { pedidoId: pedido.id, result });
-  }
+  if (result.ok) log('info', 'MAIL/TRACK/OK', 'E-mail de rastreio enviado', { pedidoId: pedido.id, id: result.id });
+  else log('error', 'MAIL/TRACK/ERROR', 'Erro ao enviar e-mail de rastreio', { pedidoId: pedido.id, result });
 }
 
-// FUNÇÃO: ENVIAR E-MAIL DE EXPIRAÇÃO DE PIX
 async function enviarEmailDeExpiracao(pedido) {
-  const emailBody = `
-        <h1>⚠️ Pagamento não confirmado para o Pedido #${pedido.id}</h1>
-        <p>Olá, ${pedido.nome_cliente}.</p>
-        <p>Notamos que o pagamento referente ao seu pedido <strong>#${pedido.id}</strong> ainda não foi confirmado.</p>
-        <p>O link para pagamento via PIX expirou para evitar pagamentos duplicados ou fraudes. Se ainda deseja adquirir os produtos, por favor, realize um novo pedido em nosso site.</p>
-        <p>Se você já pagou e acha que isso foi um engano, por favor, entre em contato conosco com o comprovante de pagamento.</p>
-        <hr>
-        <p>Agradecemos a sua compreensão.</p>
-        <p>Atenciosamente,</p>
-        <p>Equipe Carlton</p>
-    `;
+  const { subject, html } = buildEmailHtml('expiry', pedido);
 
   const result = await sendEmail({
     to: pedido.email_cliente,
     bcc: EMAIL_TO || undefined,
-    subject: `Aviso: Pagamento Pendente para o Pedido #${pedido.id}`,
-    html: emailBody,
+    subject,
+    html,
   });
 
-  if (result.ok) {
-    log('info', 'MAIL/EXPIRY/OK', 'E-mail de expiração enviado', { pedidoId: pedido.id, id: result.id });
-  } else {
-    log('error', 'MAIL/EXPIRY/ERROR', 'Erro ao enviar e-mail de expiração', { pedidoId: pedido.id, result });
-  }
+  if (result.ok) log('info', 'MAIL/EXPIRY/OK', 'E-mail de expiração enviado', { pedidoId: pedido.id, id: result.id });
+  else log('error', 'MAIL/EXPIRY/ERROR', 'Erro ao enviar e-mail de expiração', { pedidoId: pedido.id, result });
 }
 
 // ------------------- MELHOR ENVIO -------------------
@@ -771,18 +971,18 @@ async function enviarEmailDeExpiracao(pedido) {
 async function inserirPedidoNoCarrinhoME(pedido) {
   log('info', 'ME/CART/IN', 'Iniciando inserção no carrinho Melhor Envio', { pedidoId: pedido.id });
 
-  const itens = typeof pedido.itens_pedido === 'string' ? JSON.parse(pedido.itens_pedido) : pedido.itens_pedido;
-  const frete = typeof pedido.info_frete === 'string' ? JSON.parse(pedido.info_frete) : pedido.info_frete;
-  const subtotal = itens.reduce((sum, item) => sum + item.unit_price * item.quantity, 0);
-  const pesoTotal = itens.reduce((sum, item) => sum + 0.3 * item.quantity, 0);
+  const itens = typeof pedido.itens_pedido === 'string' ? JSON.parse(pedido.itens_pedido) : pedido.itens_pedido || [];
+  const frete = typeof pedido.info_frete === 'string' ? JSON.parse(pedido.info_frete) : pedido.info_frete || {};
+  const subtotal = itens.reduce((sum, item) => sum + Number(item.unit_price || 0) * Number(item.quantity || 0), 0);
+  const pesoTotal = itens.reduce((sum, item) => sum + 0.3 * Number(item.quantity || 0), 0);
 
   const payload = {
     service: frete.code,
     from: {
       name: SENDER_NAME,
-      phone: SENDER_PHONE.replace(/\D/g, ''),
+      phone: String(SENDER_PHONE || '').replace(/\D/g, ''),
       email: SENDER_EMAIL,
-      document: SENDER_DOCUMENT.replace(/\D/g, ''),
+      document: String(SENDER_DOCUMENT || '').replace(/\D/g, ''),
       address: SENDER_STREET,
       complement: SENDER_COMPLEMENT,
       number: SENDER_NUMBER,
@@ -790,13 +990,13 @@ async function inserirPedidoNoCarrinhoME(pedido) {
       city: SENDER_CITY,
       state_abbr: SENDER_STATE_ABBR,
       country_id: 'BR',
-      postal_code: SENDER_CEP.replace(/\D/g, ''),
+      postal_code: String(SENDER_CEP || '').replace(/\D/g, ''),
     },
     to: {
       name: pedido.nome_cliente,
-      phone: pedido.telefone_cliente.replace(/\D/g, ''),
+      phone: String(pedido.telefone_cliente || '').replace(/\D/g, ''),
       email: pedido.email_cliente,
-      document: pedido.cpf_cliente.replace(/\D/g, ''),
+      document: String(pedido.cpf_cliente || '').replace(/\D/g, ''),
       address: pedido.logradouro,
       complement: pedido.complemento,
       number: pedido.numero,
@@ -804,12 +1004,12 @@ async function inserirPedidoNoCarrinhoME(pedido) {
       city: pedido.cidade,
       state_abbr: pedido.estado,
       country_id: 'BR',
-      postal_code: pedido.cep.replace(/\D/g, ''),
+      postal_code: String(pedido.cep || '').replace(/\D/g, ''),
     },
     products: itens.map((item) => ({
       name: item.title || item.id,
-      quantity: item.quantity,
-      unitary_value: item.unit_price,
+      quantity: Number(item.quantity || 0),
+      unitary_value: Number(item.unit_price || 0),
       height: 10,
       width: 15,
       length: 20,
@@ -852,7 +1052,7 @@ async function inserirPedidoNoCarrinhoME(pedido) {
     });
     console.error('Payload enviado para o Melhor Envio:', JSON.stringify(payload, null, 2));
     console.error('Resposta de erro do Melhor Envio:', data);
-    throw new Error(JSON.stringify(data.error || 'Erro ao inserir no carrinho Melhor Envio.'));
+    throw new Error(JSON.stringify(data.error || data.message || 'Erro ao inserir no carrinho Melhor Envio.'));
   }
 
   const melhorEnvioId = data.id;
@@ -883,19 +1083,19 @@ app.post('/rastrear-pedido', async (req, res) => {
   }
 
   try {
-    const cpfLimpo = cpf.replace(/\D/g, '');
+    const cpfLimpo = String(cpf).replace(/\D/g, '');
 
     const sql = `
-            SELECT 
-                id, nome_cliente, status, codigo_rastreio, 
-                logradouro, bairro, cidade, estado, cep, numero, complemento,
-                itens_pedido, info_frete, valor_total,
-                data_criacao, metodo_pagamento, final_cartao
-            FROM pedidos 
-            WHERE cpf_cliente = ? AND email_cliente = ?
-            ORDER BY data_criacao DESC 
-            LIMIT 1;
-        `;
+      SELECT 
+        id, nome_cliente, status, codigo_rastreio, 
+        logradouro, bairro, cidade, estado, cep, numero, complemento,
+        itens_pedido, info_frete, valor_total,
+        data_criacao, metodo_pagamento, final_cartao
+      FROM pedidos 
+      WHERE cpf_cliente = ? AND email_cliente = ?
+      ORDER BY data_criacao DESC 
+      LIMIT 1;
+    `;
 
     const [rows] = await db.query(sql, [cpfLimpo, email]);
 
@@ -906,9 +1106,15 @@ app.post('/rastrear-pedido', async (req, res) => {
 
     const pedidoDoBanco = rows[0];
 
-    const itens = typeof pedidoDoBanco.itens_pedido === 'string' ? JSON.parse(pedidoDoBanco.itens_pedido) : pedidoDoBanco.itens_pedido || [];
+    const itens =
+      typeof pedidoDoBanco.itens_pedido === 'string'
+        ? JSON.parse(pedidoDoBanco.itens_pedido)
+        : pedidoDoBanco.itens_pedido || [];
 
-    const freteInfo = typeof pedidoDoBanco.info_frete === 'string' ? JSON.parse(pedidoDoBanco.info_frete) : pedidoDoBanco.info_frete || {};
+    const freteInfo =
+      typeof pedidoDoBanco.info_frete === 'string'
+        ? JSON.parse(pedidoDoBanco.info_frete)
+        : pedidoDoBanco.info_frete || {};
 
     const itensFormatados = itens.map((item) => ({
       id: item.id,
