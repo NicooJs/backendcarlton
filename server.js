@@ -9,6 +9,7 @@ import dotenv from 'dotenv';
 import fetch from 'node-fetch';
 import db from './db.js';
 import crypto from 'crypto';
+import { Resend } from 'resend';
 
 // --- CONFIGURAÇÃO INICIAL ---
 dotenv.config();
@@ -16,6 +17,8 @@ const app = express();
 const port = process.env.PORT || 4000;
 app.use(cors());
 
+// A body-parser precisa ser configurada com `verify` para ler o buffer da requisição,
+// que é necessário para validar a assinatura do webhook.
 app.use(express.json({
   verify: (req, res, buf) => {
     req.rawBody = buf;
@@ -26,12 +29,17 @@ app.use(express.json({
 // LOGGING (somente logs)
 // ------------------------
 const safeJson = (obj) => {
-  try { return JSON.stringify(obj, null, 2); } catch { return '[unserializable]'; }
+  try {
+    return JSON.stringify(obj, null, 2);
+  } catch {
+    return '[unserializable]';
+  }
 };
 
 const log = (level, scope, message, meta) => {
   const prefix = `[${scope}]`;
   const line = meta !== undefined ? `${prefix} ${message} ${safeJson(meta)}` : `${prefix} ${message}`;
+
   if (level === 'error') return console.error(line);
   if (level === 'warn') return console.warn(line);
   return console.log(line);
@@ -42,20 +50,24 @@ const {
   MP_ACCESS_TOKEN, MELHOR_ENVIO_TOKEN, SENDER_CEP, BACKEND_URL,
   FRONTEND_URL,
 
-  // email via API
-  EMAIL_PROVIDER,
+  // Email (Resend)
   RESEND_API_KEY,
   EMAIL_FROM,
   EMAIL_TO,
 
+  // Segurança (cron)
+  CRON_SECRET,
+
+  // Dados remetente Melhor Envio
   SENDER_NAME, SENDER_PHONE, SENDER_EMAIL,
   SENDER_DOCUMENT, SENDER_STREET, SENDER_NUMBER, SENDER_COMPLEMENT,
   SENDER_DISTRICT, SENDER_CITY, SENDER_STATE_ABBR,
 
-  MP_WEBHOOK_SECRET,
+  // Webhook MP
+  MP_WEBHOOK_SECRET
 } = process.env;
 
-// Validação das variáveis de ambiente
+// Validação das variáveis de ambiente (mantém seu contrato de não quebrar fluxo)
 if (!MP_ACCESS_TOKEN || !MELHOR_ENVIO_TOKEN || !BACKEND_URL || !FRONTEND_URL || !db) {
   log('error', 'BOOT/FATAL', 'Variáveis essenciais ausentes. Verifique .env / Railway Variables.');
   process.exit(1);
@@ -65,25 +77,73 @@ if (!MP_WEBHOOK_SECRET) {
   log('warn', 'BOOT/WARN', 'MP_WEBHOOK_SECRET não encontrada. Validação do webhook Mercado Pago DESATIVADA.');
 }
 
-// Email provider validation
-if ((EMAIL_PROVIDER || 'resend') === 'resend') {
-  if (!RESEND_API_KEY) log('warn', 'MAIL/WARN', 'RESEND_API_KEY ausente. Emails não serão enviados.');
-  if (!EMAIL_FROM) log('warn', 'MAIL/WARN', 'EMAIL_FROM ausente. Emails podem falhar no provedor.');
+// Cron secret (opcional)
+if (!CRON_SECRET) {
+  log('warn', 'BOOT/WARN', 'CRON_SECRET não definido. A rota /checar-pedidos-expirados ficará pública.');
+}
+
+// Email (Resend) validação leve
+if (!RESEND_API_KEY) {
+  log('warn', 'MAIL/BOOT/WARN', 'RESEND_API_KEY ausente. Nenhum e-mail será enviado.');
+}
+if (!EMAIL_FROM) {
+  log('warn', 'MAIL/BOOT/WARN', 'EMAIL_FROM ausente. Defina algo como: "Carlton <onboarding@resend.dev>".');
+}
+if (!EMAIL_TO) {
+  log('warn', 'MAIL/BOOT/WARN', 'EMAIL_TO ausente. Recomendo colocar um email admin pra receber cópia/teste.');
 }
 
 // --- CONFIGURAÇÃO DOS SERVIÇOS ---
 const client = new MercadoPagoConfig({ accessToken: MP_ACCESS_TOKEN });
+const resend = RESEND_API_KEY ? new Resend(RESEND_API_KEY) : null;
 
 // ------------------------
-// HELPERS EMAIL (RESEND)
+// HELPERS
 // ------------------------
-const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+const parseXSignature = (raw) => {
+  if (!raw || typeof raw !== 'string') return { ts: null, v1: null };
+  const parts = raw.split(',');
+  const out = { ts: null, v1: null };
+  for (const p of parts) {
+    const [k, v] = p.split('=');
+    if (!k || !v) continue;
+    const key = k.trim();
+    const val = v.trim();
+    if (key === 'ts') out.ts = val;
+    if (key === 'v1') out.v1 = val;
+  }
+  return out;
+};
 
-const sendEmail = async ({ to, subject, html, bcc }) => {
-  // Se não tiver key, só loga e retorna false (não quebra pagamento/frete)
-  if (!RESEND_API_KEY) {
-    log('warn', 'MAIL/SKIP', 'RESEND_API_KEY ausente. Pulando envio.', { to, subject });
-    return false;
+// Validação webhook MP (segue seu padrão, mas com trim/robustez)
+const validateMpWebhook = (req) => {
+  if (!MP_WEBHOOK_SECRET) return { ok: true, reason: 'disabled' };
+
+  const signature = req.headers['x-signature'];
+  if (!signature) return { ok: false, reason: 'missing_signature' };
+
+  const { ts, v1 } = parseXSignature(signature);
+  if (!ts || !v1) return { ok: false, reason: 'bad_signature_format' };
+
+  const id = req.query.id || req.query['data.id'];
+  if (!id) return { ok: false, reason: 'missing_id' };
+
+  // Mantém a string que você já usava (sem quebrar), só deixando mais “resistente”
+  const message = `id:${String(id).trim()};ts:${String(ts).trim()};`;
+  const expected = crypto.createHmac('sha256', MP_WEBHOOK_SECRET).update(message).digest('hex');
+
+  return { ok: expected === v1, reason: expected === v1 ? 'ok' : 'invalid_signature' };
+};
+
+// Email sender (Resend)
+async function sendEmail({ to, subject, html, bcc }) {
+  if (!resend) {
+    log('warn', 'MAIL/SKIP', 'Resend não configurado (RESEND_API_KEY ausente). Pulando envio.', { to, subject });
+    return { ok: false, reason: 'missing_resend_key' };
+  }
+  if (!EMAIL_FROM) {
+    log('warn', 'MAIL/SKIP', 'EMAIL_FROM ausente. Pulando envio.', { to, subject });
+    return { ok: false, reason: 'missing_email_from' };
   }
 
   try {
@@ -91,73 +151,55 @@ const sendEmail = async ({ to, subject, html, bcc }) => {
       from: EMAIL_FROM,
       to: Array.isArray(to) ? to : [to],
       subject,
-      html,
+      html
     };
     if (bcc) payload.bcc = Array.isArray(bcc) ? bcc : [bcc];
 
-    const resp = await fetch('https://api.resend.com/emails', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${RESEND_API_KEY}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify(payload),
-    });
+    const { data, error } = await resend.emails.send(payload);
 
-    const data = await resp.json().catch(() => ({}));
-
-    if (!resp.ok) {
-      log('error', 'MAIL/ERROR', 'Resend retornou erro', { status: resp.status, data });
-      return false;
+    if (error) {
+      log('error', 'MAIL/SEND/ERROR', 'Erro ao enviar via Resend', { error });
+      return { ok: false, reason: 'resend_error', error };
     }
 
-    log('info', 'MAIL/OK', 'E-mail enviado via Resend', { to, subject, id: data?.id });
-    return true;
-  } catch (error) {
-    log('error', 'MAIL/ERROR', 'Falha ao enviar via Resend', { message: error?.message, stack: error?.stack });
-    return false;
+    log('info', 'MAIL/SEND/OK', 'Email enviado via Resend', { id: data?.id, to: payload.to, subject });
+    return { ok: true, id: data?.id };
+  } catch (err) {
+    log('error', 'MAIL/SEND/FATAL', 'Falha inesperada ao enviar via Resend', { message: err?.message, stack: err?.stack });
+    return { ok: false, reason: 'exception', error: err?.message };
   }
-};
-
-// ------------------------
-// WEBHOOK SIGNATURE (MP)
-// ------------------------
-const parseXSignature = (raw) => {
-  if (!raw || typeof raw !== 'string') return { ts: null, v1: null };
-  const parts = raw.split(',');
-  let ts = null, v1 = null;
-  for (const part of parts) {
-    const [k, v] = part.split('=');
-    if (!k || !v) continue;
-    const key = k.trim();
-    const val = v.trim();
-    if (key === 'ts') ts = val;
-    if (key === 'v1') v1 = val;
-  }
-  return { ts, v1 };
-};
-
-const verifyMercadoPagoSignature = (req) => {
-  if (!MP_WEBHOOK_SECRET) return { ok: true, reason: 'disabled' };
-
-  const xSignature = req.headers['x-signature'];
-  const xRequestId = req.headers['x-request-id'];
-  const paymentId = req.query.id || req.query['data.id'];
-
-  if (!xSignature) return { ok: false, reason: 'missing_x_signature' };
-  if (!xRequestId) return { ok: false, reason: 'missing_x_request_id' };
-  if (!paymentId) return { ok: false, reason: 'missing_id' };
-
-  const { ts, v1 } = parseXSignature(xSignature);
-  if (!ts || !v1) return { ok: false, reason: 'bad_x_signature_format' };
-
-  const manifest = `id:${paymentId};request-id:${String(xRequestId).trim()};ts:${String(ts).trim()};`;
-  const expected = crypto.createHmac('sha256', MP_WEBHOOK_SECRET).update(manifest).digest('hex');
-
-  return { ok: expected === v1, reason: expected === v1 ? 'ok' : 'invalid_signature' };
-};
+}
 
 // ------------------- ROTAS DA APLICAÇÃO -------------------
+
+// ✅ ROTA DE TESTE DE EMAIL (pra você validar em produção)
+app.get('/test-email', async (req, res) => {
+  const to = req.query.to ? String(req.query.to).trim() : EMAIL_TO;
+
+  if (!to) {
+    return res.status(400).json({ error: 'Defina EMAIL_TO no Railway ou passe ?to=seuemail@...' });
+  }
+
+  const result = await sendEmail({
+    to,
+    // opcional: manda cópia pro admin se você quiser sempre
+    bcc: EMAIL_TO && EMAIL_TO !== to ? EMAIL_TO : undefined,
+    subject: '✅ Teste de Email — CARLTON',
+    html: `
+      <div style="font-family: Arial, sans-serif; color:#111;">
+        <h1 style="margin:0 0 12px;">🔥 Email funcionando!</h1>
+        <p style="margin:0 0 8px;">Se você recebeu isso, o envio via Railway (Resend) está OK.</p>
+        <p style="margin:0 0 8px;"><strong>Data:</strong> ${new Date().toISOString()}</p>
+        <hr style="margin:16px 0;" />
+        <p style="margin:0;">CARLTON</p>
+      </div>
+    `
+  });
+
+  if (!result.ok) return res.status(500).json({ ok: false, result });
+
+  return res.status(200).json({ ok: true, id: result.id, to });
+});
 
 // ROTA /criar-preferencia
 app.post('/criar-preferencia', async (req, res) => {
@@ -180,10 +222,10 @@ app.post('/criar-preferencia', async (req, res) => {
     const fullAddress = `${customerInfo.address}, ${customerInfo.number} ${customerInfo.complement || ''} - ${customerInfo.neighborhood}, ${customerInfo.city}/${customerInfo.state}, CEP: ${customerInfo.cep}`;
 
     const sql = `INSERT INTO pedidos (
-      nome_cliente, email_cliente, cpf_cliente, telefone_cliente, 
-      endereco_entrega, cep, logradouro, numero, complemento, bairro, cidade, estado,
-      itens_pedido, info_frete, valor_total, status, expiracao_pix
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'AGUARDANDO_PAGAMENTO', ?);`;
+            nome_cliente, email_cliente, cpf_cliente, telefone_cliente, 
+            endereco_entrega, cep, logradouro, numero, complemento, bairro, cidade, estado,
+            itens_pedido, info_frete, valor_total, status, expiracao_pix
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'AGUARDANDO_PAGAMENTO', ?);`;
 
     const expiracaoPix = new Date(Date.now() + 30 * 60 * 1000);
 
@@ -195,7 +237,6 @@ app.post('/criar-preferencia', async (req, res) => {
       customerInfo.city, customerInfo.state, JSON.stringify(items),
       JSON.stringify(selectedShipping), total, expiracaoPix
     ]);
-
     const novoPedidoId = result.insertId;
 
     const now = new Date();
@@ -273,7 +314,7 @@ app.post('/calcular-frete', async (req, res) => {
           throw new Error('Não foi possível conectar com o serviço de CEP no momento. Por favor, tente novamente mais tarde.');
         }
         log('warn', 'API/FRETE/VIACEP_RETRY', 'Tentativa ViaCEP falhou. Tentando novamente...', { attempts });
-        await sleep(1000 * attempts);
+        await new Promise(resolve => setTimeout(resolve, 1000 * attempts));
       }
     }
 
@@ -351,13 +392,12 @@ app.post('/calcular-frete', async (req, res) => {
 
 // ROTA DE WEBHOOK PARA NOTIFICAÇÕES DO MERCADO PAGO
 app.post('/notificacao-pagamento', async (req, res) => {
-  const sig = verifyMercadoPagoSignature(req);
+  const sig = validateMpWebhook(req);
   if (!sig.ok) {
     log('error', 'MP/WEBHOOK/SIG_INVALID', 'Assinatura inválida (bloqueado)', {
       reason: sig.reason,
-      id: req.query?.id || req.query?.['data.id'],
-      topic: req.query?.topic || req.query?.type,
-      requestId: req.headers['x-request-id']
+      id: req.query?.id,
+      topic: req.query?.topic || req.query?.type
     });
     return res.status(401).send('Invalid signature');
   }
@@ -365,7 +405,10 @@ app.post('/notificacao-pagamento', async (req, res) => {
   const topic = req.query.topic || req.query.type;
   const paymentIdCandidate = req.query.id || req.query['data.id'];
 
-  log('info', 'MP/WEBHOOK/IN', 'Notificação recebida', { topic, id: paymentIdCandidate });
+  log('info', 'MP/WEBHOOK/IN', 'Notificação recebida', {
+    topic,
+    id: paymentIdCandidate
+  });
 
   if (topic === 'payment') {
     try {
@@ -379,26 +422,29 @@ app.post('/notificacao-pagamento', async (req, res) => {
         if (rows.length > 0) {
           const pedidoDoBanco = rows[0];
 
+          // Evita processar novamente um pedido já pago ou em produção
           if (pedidoDoBanco.status !== 'AGUARDANDO_PAGAMENTO' && pedidoDoBanco.status !== 'PAGAMENTO_PENDENTE') {
-            log('info', 'MP/IDEMPOTENT', 'Pedido já processado, ignorando', { pedidoId, status: pedidoDoBanco.status });
+            log('info', 'MP/IDEMPOTENT', 'Pedido já processado, ignorando', {
+              pedidoId,
+              status: pedidoDoBanco.status
+            });
           } else {
             const isApproved = payment.status === 'approved';
             const novoStatus = isApproved ? 'EM_PRODUCAO' : 'PAGAMENTO_PENDENTE';
 
             if (isApproved) {
-              const metodoPagamento =
-                payment.payment_type_id === 'credit_card' ? 'Cartão de Crédito' :
+              const metodoPagamento = payment.payment_type_id === 'credit_card' ? 'Cartão de Crédito' :
                 payment.payment_type_id === 'ticket' ? 'Boleto' :
-                payment.payment_method_id === 'pix' ? 'PIX' :
-                (payment.payment_method_id || 'Não especificado');
+                  payment.payment_method_id === 'pix' ? 'PIX' :
+                    (payment.payment_method_id || 'Não especificado');
 
               const finalCartao = payment.card ? payment.card.last_four_digits : null;
 
               const sql = `
-                UPDATE pedidos 
-                SET status = ?, mercado_pago_id = ?, metodo_pagamento = ?, final_cartao = ? 
-                WHERE id = ?
-              `;
+                                UPDATE pedidos 
+                                SET status = ?, mercado_pago_id = ?, metodo_pagamento = ?, final_cartao = ? 
+                                WHERE id = ?
+                            `;
 
               await db.query(sql, [novoStatus, payment.id, metodoPagamento, finalCartao, pedidoId]);
 
@@ -417,7 +463,10 @@ app.post('/notificacao-pagamento', async (req, res) => {
                 [novoStatus, payment.id, pedidoId]
               );
 
-              log('info', 'MP/PAGAMENTO/PENDENTE', 'Pedido atualizado para PAGAMENTO_PENDENTE', { pedidoId, paymentId: payment.id });
+              log('info', 'MP/PAGAMENTO/PENDENTE', 'Pedido atualizado para PAGAMENTO_PENDENTE', {
+                pedidoId,
+                paymentId: payment.id
+              });
             }
           }
         } else {
@@ -427,7 +476,10 @@ app.post('/notificacao-pagamento', async (req, res) => {
         log('warn', 'MP/WEBHOOK/NO_REF', 'Payment sem external_reference', { paymentId: paymentIdCandidate });
       }
     } catch (error) {
-      log('error', 'MP/WEBHOOK/ERROR', 'Erro ao processar notificação', { message: error?.message, stack: error?.stack });
+      log('error', 'MP/WEBHOOK/ERROR', 'Erro ao processar notificação', {
+        message: error?.message,
+        stack: error?.stack
+      });
     }
   } else {
     log('info', 'MP/WEBHOOK/IGNORED', 'Notificação ignorada (topic não suportado)', { topic });
@@ -453,7 +505,11 @@ app.post('/webhook-melhorenvio', async (req, res) => {
         const sql = "UPDATE pedidos SET codigo_rastreio = ?, status = 'ENVIADO' WHERE id = ?";
         await db.query(sql, [tracking, pedido.id]);
 
-        log('info', 'ME/TRACKING/OK', 'Pedido atualizado para ENVIADO', { pedidoId: pedido.id, melhorEnvioId: id, tracking });
+        log('info', 'ME/TRACKING/OK', 'Pedido atualizado para ENVIADO', {
+          pedidoId: pedido.id,
+          melhorEnvioId: id,
+          tracking
+        });
 
         await enviarEmailComRastreio(pedido, tracking);
       } else {
@@ -468,13 +524,25 @@ app.post('/webhook-melhorenvio', async (req, res) => {
 
     res.status(200).send("Webhook do Melhor Envio processado com sucesso");
   } catch (error) {
-    log('error', 'ME/WEBHOOK/ERROR', 'Erro ao processar webhook Melhor Envio', { message: error?.message, stack: error?.stack });
+    log('error', 'ME/WEBHOOK/ERROR', 'Erro ao processar webhook Melhor Envio', {
+      message: error?.message,
+      stack: error?.stack
+    });
     res.status(500).send("Erro no processamento do webhook");
   }
 });
 
-// ROTA PARA CHECAR PEDIDOS EXPIRADOS
+// ROTA PARA CHECAR PEDIDOS EXPIRADOS (cron)
 app.get('/checar-pedidos-expirados', async (req, res) => {
+  // Proteção opcional por token
+  if (CRON_SECRET) {
+    const token = req.query.token || req.headers['x-cron-token'];
+    if (String(token || '') !== String(CRON_SECRET)) {
+      log('warn', 'CRON/AUTH', 'Token inválido para /checar-pedidos-expirados');
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+  }
+
   log('info', 'CRON/EXPIRACAO/IN', 'Iniciando checagem de pedidos expirados.');
 
   try {
@@ -484,105 +552,112 @@ app.get('/checar-pedidos-expirados', async (req, res) => {
 
     for (const pedido of pedidosExpirados) {
       await db.query("UPDATE pedidos SET status = 'CANCELADO_POR_EXPIRACAO' WHERE id = ?", [pedido.id]);
-
-      const ok = await enviarEmailDeExpiracao(pedido);
-      log(ok ? 'info' : 'warn', 'CRON/EXPIRACAO/CANCEL', ok
-        ? 'Pedido cancelado por expiração e e-mail enviado'
-        : 'Pedido cancelado por expiração, mas e-mail falhou',
-        { pedidoId: pedido.id }
-      );
+      await enviarEmailDeExpiracao(pedido);
+      log('info', 'CRON/EXPIRACAO/CANCEL', 'Pedido cancelado por expiração e e-mail disparado', { pedidoId: pedido.id });
     }
 
     log('info', 'CRON/EXPIRACAO/OK', 'Checagem concluída', { cancelados: pedidosExpirados.length });
     res.status(200).json({ message: `Checagem concluída. ${pedidosExpirados.length} pedidos atualizados.` });
   } catch (error) {
-    log('error', 'CRON/EXPIRACAO/ERROR', 'Erro ao checar pedidos expirados', { message: error?.message, stack: error?.stack });
+    log('error', 'CRON/EXPIRACAO/ERROR', 'Erro ao checar pedidos expirados', {
+      message: error?.message,
+      stack: error?.stack
+    });
     res.status(500).json({ error: "Erro interno na checagem de pedidos." });
   }
 });
 
-// ------------------- EMAILS -------------------
+// ------------------- FUNÇÕES DE EMAIL (RESEND) -------------------
 
-// CONFIRMAÇÃO: cliente recebe no "to" + você em BCC (EMAIL_TO)
+// FUNÇÃO AUXILIAR DE ENVIO DE E-MAIL (CONFIRMAÇÃO)
 async function enviarEmailDeConfirmacao(pedido) {
   const itens = typeof pedido.itens_pedido === 'string' ? JSON.parse(pedido.itens_pedido) : pedido.itens_pedido;
   const frete = typeof pedido.info_frete === 'string' ? JSON.parse(pedido.info_frete) : pedido.info_frete;
 
   const emailBody = `
-    <h1>🎉 Pedido Confirmado! (Nº ${pedido.id})</h1>
-    <p>Olá, ${pedido.nome_cliente}. Seu pagamento foi aprovado!</p>
-    <p><strong>ID do Pagamento (Mercado Pago):</strong> ${pedido.mercado_pago_id}</p>
-    <hr>
-    <h2>Endereço de Entrega</h2>
-    <p>${pedido.endereco_entrega}</p>
-    <hr>
-    <h2>Detalhes do Pedido</h2>
-    <ul>
-      ${itens.map(item => `<li>${item.quantity}x ${item.title} - R$ ${Number(item.unit_price).toFixed(2)} cada</li>`).join('')}
-    </ul>
-    <hr>
-    <h2>Valores</h2>
-    <p><strong>Frete (${frete.name}):</strong> R$ ${Number(frete.price).toFixed(2)}</p>
-    <h3><strong>Total:</strong> R$ ${Number(pedido.valor_total).toFixed(2)}</h3>
-  `;
+        <h1>🎉 Pedido Confirmado! (Nº ${pedido.id})</h1>
+        <p>Olá, ${pedido.nome_cliente}. Seu pagamento foi aprovado!</p>
+        <p><strong>ID do Pagamento (Mercado Pago):</strong> ${pedido.mercado_pago_id}</p>
+        <hr>
+        <h2>Endereço de Entrega</h2>
+        <p>${pedido.endereco_entrega}</p>
+        <hr>
+        <h2>Detalhes do Pedido</h2>
+        <ul>
+        ${itens.map(item => `<li>${item.quantity}x ${item.title} - R$ ${Number(item.unit_price).toFixed(2)} cada</li>`).join('')}
+        </ul>
+        <hr>
+        <h2>Valores</h2>
+        <p><strong>Frete (${frete.name}):</strong> R$ ${Number(frete.price).toFixed(2)}</p>
+        <h3><strong>Total:</strong> R$ ${Number(pedido.valor_total).toFixed(2)}</h3>
+    `;
 
-  const bcc = EMAIL_TO ? EMAIL_TO : undefined;
-
-  const ok = await sendEmail({
+  const result = await sendEmail({
+    // Cliente recebe
     to: pedido.email_cliente,
-    bcc,
+    // Admin recebe cópia (se setado)
+    bcc: EMAIL_TO || undefined,
     subject: `Confirmação do Pedido #${pedido.id}`,
     html: emailBody,
   });
 
-  log(ok ? 'info' : 'warn', 'MAIL/CONFIRM', ok ? 'E-mail de confirmação enviado' : 'Falha ao enviar e-mail de confirmação', { pedidoId: pedido.id });
+  if (result.ok) {
+    log('info', 'MAIL/CONFIRM/OK', 'E-mail de confirmação enviado', { pedidoId: pedido.id, id: result.id });
+  } else {
+    log('error', 'MAIL/CONFIRM/ERROR', 'Erro ao enviar e-mail de confirmação', { pedidoId: pedido.id, result });
+  }
 }
 
-// RASTREIO
+// FUNÇÃO: ENVIAR E-MAIL COM RASTREIO
 async function enviarEmailComRastreio(pedido, trackingCode) {
   const emailBody = `
-    <h1>📦 Seu pedido foi postado!</h1>
-    <p>Olá, ${pedido.nome_cliente}.</p>
-    <p>Seu pedido <strong>#${pedido.id}</strong> já foi enviado.</p>
-    <p><strong>Código de rastreio:</strong> ${trackingCode}</p>
-    <p>Acompanhe pelo site dos Correios ou Melhor Envio.</p>
-  `;
+        <h1>📦 Seu pedido foi postado!</h1>
+        <p>Olá, ${pedido.nome_cliente}.</p>
+        <p>Seu pedido <strong>#${pedido.id}</strong> já foi enviado.</p>
+        <p><strong>Código de rastreio:</strong> ${trackingCode}</p>
+        <p>Acompanhe pelo site dos Correios ou Melhor Envio.</p>
+    `;
 
-  const bcc = EMAIL_TO ? EMAIL_TO : undefined;
-
-  const ok = await sendEmail({
+  const result = await sendEmail({
     to: pedido.email_cliente,
-    bcc,
+    bcc: EMAIL_TO || undefined,
     subject: `Código de Rastreio - Pedido #${pedido.id}`,
     html: emailBody,
   });
 
-  log(ok ? 'info' : 'warn', 'MAIL/TRACK', ok ? 'E-mail de rastreio enviado' : 'Falha ao enviar e-mail de rastreio', { pedidoId: pedido.id });
+  if (result.ok) {
+    log('info', 'MAIL/TRACK/OK', 'E-mail de rastreio enviado', { pedidoId: pedido.id, id: result.id });
+  } else {
+    log('error', 'MAIL/TRACK/ERROR', 'Erro ao enviar e-mail de rastreio', { pedidoId: pedido.id, result });
+  }
 }
 
-// EXPIRAÇÃO
+// FUNÇÃO: ENVIAR E-MAIL DE EXPIRAÇÃO DE PIX
 async function enviarEmailDeExpiracao(pedido) {
   const emailBody = `
-    <h1>⚠️ Pagamento não confirmado para o Pedido #${pedido.id}</h1>
-    <p>Olá, ${pedido.nome_cliente}.</p>
-    <p>Notamos que o pagamento referente ao seu pedido <strong>#${pedido.id}</strong> ainda não foi confirmado.</p>
-    <p>O link para pagamento via PIX expirou para evitar pagamentos duplicados ou fraudes. Se ainda deseja adquirir os produtos, por favor, realize um novo pedido em nosso site.</p>
-    <p>Se você já pagou e acha que isso foi um engano, por favor, entre em contato conosco com o comprovante de pagamento.</p>
-    <hr>
-    <p>Atenciosamente,</p>
-    <p>Equipe Carlton</p>
-  `;
+        <h1>⚠️ Pagamento não confirmado para o Pedido #${pedido.id}</h1>
+        <p>Olá, ${pedido.nome_cliente}.</p>
+        <p>Notamos que o pagamento referente ao seu pedido <strong>#${pedido.id}</strong> ainda não foi confirmado.</p>
+        <p>O link para pagamento via PIX expirou para evitar pagamentos duplicados ou fraudes. Se ainda deseja adquirir os produtos, por favor, realize um novo pedido em nosso site.</p>
+        <p>Se você já pagou e acha que isso foi um engano, por favor, entre em contato conosco com o comprovante de pagamento.</p>
+        <hr>
+        <p>Agradecemos a sua compreensão.</p>
+        <p>Atenciosamente,</p>
+        <p>Equipe Carlton</p>
+    `;
 
-  const bcc = EMAIL_TO ? EMAIL_TO : undefined;
-
-  const ok = await sendEmail({
+  const result = await sendEmail({
     to: pedido.email_cliente,
-    bcc,
+    bcc: EMAIL_TO || undefined,
     subject: `Aviso: Pagamento Pendente para o Pedido #${pedido.id}`,
     html: emailBody,
   });
 
-  return ok;
+  if (result.ok) {
+    log('info', 'MAIL/EXPIRY/OK', 'E-mail de expiração enviado', { pedidoId: pedido.id, id: result.id });
+  } else {
+    log('error', 'MAIL/EXPIRY/ERROR', 'Erro ao enviar e-mail de expiração', { pedidoId: pedido.id, result });
+  }
 }
 
 // ------------------- MELHOR ENVIO -------------------
@@ -649,7 +724,10 @@ async function inserirPedidoNoCarrinhoME(pedido) {
 
   const data = await response.json();
   if (!response.ok) {
-    log('error', 'ME/CART/ERROR', 'Erro ao inserir no carrinho do Melhor Envio', { status: response.status, response: data });
+    log('error', 'ME/CART/ERROR', 'Erro ao inserir no carrinho do Melhor Envio', {
+      status: response.status,
+      response: data
+    });
     console.error("Payload enviado para o Melhor Envio:", JSON.stringify(payload, null, 2));
     console.error("Resposta de erro do Melhor Envio:", data);
     throw new Error(JSON.stringify(data.error || 'Erro ao inserir no carrinho Melhor Envio.'));
@@ -657,8 +735,15 @@ async function inserirPedidoNoCarrinhoME(pedido) {
 
   const melhorEnvioId = data.id;
   if (melhorEnvioId) {
-    await db.query("UPDATE pedidos SET melhor_envio_id = ? WHERE id = ?", [melhorEnvioId, pedido.id]);
-    log('info', 'ME/CART/OK', 'ID do Melhor Envio salvo no pedido', { pedidoId: pedido.id, melhorEnvioId });
+    await db.query(
+      "UPDATE pedidos SET melhor_envio_id = ? WHERE id = ?",
+      [melhorEnvioId, pedido.id]
+    );
+
+    log('info', 'ME/CART/OK', 'ID do Melhor Envio salvo no pedido', {
+      pedidoId: pedido.id,
+      melhorEnvioId
+    });
   }
 
   log('info', 'ME/CART/OK', 'Pedido inserido no carrinho do Melhor Envio', { pedidoId: pedido.id });
@@ -668,7 +753,10 @@ async function inserirPedidoNoCarrinhoME(pedido) {
 app.post('/rastrear-pedido', async (req, res) => {
   const { cpf, email } = req.body;
 
-  log('info', 'API/RASTREIO/IN', 'Solicitação recebida', { hasCpf: !!cpf, hasEmail: !!email });
+  log('info', 'API/RASTREIO/IN', 'Solicitação recebida', {
+    hasCpf: !!cpf,
+    hasEmail: !!email
+  });
 
   if (!cpf || !email) {
     log('warn', 'API/RASTREIO/INVALID', 'CPF e e-mail são obrigatórios');
@@ -679,16 +767,16 @@ app.post('/rastrear-pedido', async (req, res) => {
     const cpfLimpo = cpf.replace(/\D/g, '');
 
     const sql = `
-      SELECT 
-        id, nome_cliente, status, codigo_rastreio, 
-        logradouro, bairro, cidade, estado, cep, numero, complemento,
-        itens_pedido, info_frete, valor_total,
-        data_criacao, metodo_pagamento, final_cartao
-      FROM pedidos 
-      WHERE cpf_cliente = ? AND email_cliente = ?
-      ORDER BY data_criacao DESC 
-      LIMIT 1;
-    `;
+            SELECT 
+                id, nome_cliente, status, codigo_rastreio, 
+                logradouro, bairro, cidade, estado, cep, numero, complemento,
+                itens_pedido, info_frete, valor_total,
+                data_criacao, metodo_pagamento, final_cartao
+            FROM pedidos 
+            WHERE cpf_cliente = ? AND email_cliente = ?
+            ORDER BY data_criacao DESC 
+            LIMIT 1;
+        `;
 
     const [rows] = await db.query(sql, [cpfLimpo, email]);
 
@@ -724,7 +812,9 @@ app.post('/rastrear-pedido', async (req, res) => {
       data_envio: null,
       data_entrega: null,
       data_prevista_entrega: null,
+
       cliente: { nome: pedidoDoBanco.nome_cliente },
+
       endereco_entrega: {
         rua: `${pedidoDoBanco.logradouro}, ${pedidoDoBanco.numero}`,
         bairro: pedidoDoBanco.bairro,
@@ -732,19 +822,29 @@ app.post('/rastrear-pedido', async (req, res) => {
         estado: pedidoDoBanco.estado,
         cep: pedidoDoBanco.cep,
       },
+
       itens: itensFormatados,
+
       pagamento: {
         metodo: pedidoDoBanco.metodo_pagamento || 'Não informado',
         final_cartao: pedidoDoBanco.final_cartao ? `**** **** **** ${pedidoDoBanco.final_cartao}` : null,
       },
+
       frete: parseFloat(freteInfo.price || 0)
     };
 
-    log('info', 'API/RASTREIO/OK', 'Pedido encontrado e enviado ao frontend', { pedidoId: pedidoDoBanco.id, status: pedidoDoBanco.status });
+    log('info', 'API/RASTREIO/OK', 'Pedido encontrado e enviado ao frontend', {
+      pedidoId: pedidoDoBanco.id,
+      status: pedidoDoBanco.status
+    });
 
     res.status(200).json(dadosFormatadosParaFrontend);
+
   } catch (error) {
-    log('error', 'API/RASTREIO/ERROR', 'Erro ao buscar pedido pelo CPF', { message: error?.message, stack: error?.stack });
+    log('error', 'API/RASTREIO/ERROR', 'Erro ao buscar pedido pelo CPF', {
+      message: error?.message,
+      stack: error?.stack
+    });
     res.status(500).json({ error: 'Ocorreu um erro interno. Por favor, tente mais tarde.' });
   }
 });
