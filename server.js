@@ -607,6 +607,35 @@ app.get('/ping', (req, res) => {
   return res.status(200).json({ ok: true, now: new Date().toISOString() });
 });
 
+// ✅ Status público do pedido (para a tela /pendente fazer polling)
+// Retorna APENAS o essencial (sem dados sensíveis)
+app.get('/pedido-status/:id', async (req, res) => {
+  try {
+    const pedidoId = String(req.params.id || '').trim();
+
+    if (!pedidoId || !/^\d+$/.test(pedidoId)) {
+      return res.status(400).json({ error: 'pedidoId inválido' });
+    }
+
+    const [rows] = await db.query(
+      'SELECT id, status, mercado_pago_id, metodo_pagamento FROM pedidos WHERE id = ? LIMIT 1;',
+      [pedidoId]
+    );
+
+    if (!rows.length) return res.status(404).json({ error: 'Pedido não encontrado' });
+
+    res.setHeader('Cache-Control', 'no-store');
+    return res.status(200).json({
+      pedidoId: rows[0].id,
+      status: rows[0].status,
+      mercadoPagoId: rows[0].mercado_pago_id || null,
+      metodoPagamento: rows[0].metodo_pagamento || null,
+    });
+  } catch (err) {
+    return res.status(500).json({ error: 'Erro interno' });
+  }
+});
+
 // ✅ Teste email simples
 app.get('/test-email', async (req, res) => {
   const to = req.query.to ? String(req.query.to).trim() : EMAIL_TO;
