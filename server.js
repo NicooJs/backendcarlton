@@ -199,6 +199,43 @@ const validateMpWebhook = (req) => {
 };
 
 // ------------------------
+// HTTP HELPERS (robusto p/ JSON)
+// ------------------------
+async function fetchJsonSafe(url, options = {}, { timeoutMs = 8000 } = {}) {
+  const controller = new AbortController();
+  const t = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const resp = await fetch(url, {
+      ...options,
+      signal: controller.signal,
+    });
+
+    const contentType = String(resp.headers.get('content-type') || '');
+    const bodyText = await resp.text();
+
+    if (!resp.ok) {
+      throw new Error(`HTTP ${resp.status} (${contentType}) :: ${bodyText.slice(0, 160)}`);
+    }
+
+    const trimmed = bodyText.trim();
+    const looksLikeJson =
+      contentType.includes('application/json') || trimmed.startsWith('{') || trimmed.startsWith('[');
+
+    if (!looksLikeJson) {
+      throw new Error(`Resposta não-JSON (${contentType}) :: ${trimmed.slice(0, 160)}`);
+    }
+
+    return JSON.parse(bodyText);
+  } catch (err) {
+    if (String(err?.name) === 'AbortError') throw new Error(`Timeout após ${timeoutMs}ms`);
+    throw err;
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+// ------------------------
 // EMAIL TEMPLATES (EDITÁVEL)
 // ------------------------
 const escapeHtml = (str = '') =>
@@ -470,7 +507,6 @@ const isDomainNotVerified403 = (error) => {
 async function sendEmailViaResend({ to, subject, html, bcc }) {
   if (!resend) return { ok: false, reason: 'missing_resend_key' };
 
-  // ✅ prioridade: PRIMARY -> (fallback automático) -> compat EMAIL_FROM -> default resend
   const primaryFrom = EMAIL_FROM_PRIMARY || '';
   const fallbackFrom = EMAIL_FROM_FALLBACK || 'Carlton <onboarding@resend.dev>';
   const compatFrom = EMAIL_FROM || '';
@@ -478,14 +514,9 @@ async function sendEmailViaResend({ to, subject, html, bcc }) {
   const toList = normalizeList(to);
   const bccList = normalizeList(bcc);
 
-  const basePayload = {
-    to: toList,
-    subject,
-    html,
-  };
+  const basePayload = { to: toList, subject, html };
   if (bccList.length) basePayload.bcc = bccList;
 
-  // helper de envio
   const trySend = async (from) => {
     const payload = { ...basePayload, from };
     if (MAIL_REPLY_TO) payload.reply_to = MAIL_REPLY_TO;
@@ -498,7 +529,6 @@ async function sendEmailViaResend({ to, subject, html, bcc }) {
   };
 
   try {
-    // 1) tenta PRIMARY se existir
     if (primaryFrom) {
       const r1 = await trySend(primaryFrom);
       if (r1.ok) {
@@ -506,24 +536,23 @@ async function sendEmailViaResend({ to, subject, html, bcc }) {
         return { ok: true, id: r1.id, provider: 'resend', fromUsed: primaryFrom };
       }
 
-      // se falhou por domínio não verificado, cai pro fallback
       if (isDomainNotVerified403(r1.error)) {
         log('warn', 'MAIL/RESEND/FROM_FALLBACK', 'Domínio não verificado — usando fallback', { error: r1.error });
+
         const r2 = await trySend(fallbackFrom);
         if (!r2.ok) {
           log('error', 'MAIL/RESEND/ERROR', 'Erro ao enviar via Resend (fallback)', { error: r2.error });
           return { ok: false, reason: 'resend_error', error: r2.error };
         }
+
         log('info', 'MAIL/RESEND/OK', 'Email enviado via Resend (fallback)', { id: r2.id, to: toList, subject });
         return { ok: true, id: r2.id, provider: 'resend', fromUsed: fallbackFrom };
       }
 
-      // erro diferente -> retorna
       log('error', 'MAIL/RESEND/ERROR', 'Erro ao enviar via Resend (primary)', { error: r1.error });
       return { ok: false, reason: 'resend_error', error: r1.error };
     }
 
-    // 2) se não tem primary, tenta compat EMAIL_FROM se existir
     if (compatFrom) {
       const r = await trySend(compatFrom);
       if (!r.ok) {
@@ -534,12 +563,12 @@ async function sendEmailViaResend({ to, subject, html, bcc }) {
       return { ok: true, id: r.id, provider: 'resend', fromUsed: compatFrom };
     }
 
-    // 3) fallback puro
     const rf = await trySend(fallbackFrom);
     if (!rf.ok) {
       log('error', 'MAIL/RESEND/ERROR', 'Erro ao enviar via Resend (fallback)', { error: rf.error });
       return { ok: false, reason: 'resend_error', error: rf.error };
     }
+
     log('info', 'MAIL/RESEND/OK', 'Email enviado via Resend (fallback)', { id: rf.id, to: toList, subject });
     return { ok: true, id: rf.id, provider: 'resend', fromUsed: fallbackFrom };
   } catch (err) {
@@ -584,14 +613,12 @@ async function sendEmailViaGmail({ to, subject, html, bcc }) {
 async function sendEmail({ to, subject, html, bcc }) {
   const provider = String(MAIL_PROVIDER || 'resend').toLowerCase();
 
-  // ✅ Produção Railway: Resend (auto = resend) -> nada de SMTP travando
   if (provider === 'resend' || provider === 'auto' || !provider) {
     const r = await sendEmailViaResend({ to, subject, html, bcc });
     if (!r.ok) log('warn', 'MAIL/RESEND/SKIP', 'Resend falhou', r);
     return r;
   }
 
-  // gmail só se você setar explicitamente (ex: local)
   if (provider === 'gmail') {
     const r = await sendEmailViaGmail({ to, subject, html, bcc });
     if (!r.ok) log('warn', 'MAIL/GMAIL/SKIP', 'Gmail falhou', r);
@@ -608,7 +635,6 @@ app.get('/ping', (req, res) => {
 });
 
 // ✅ Status público do pedido (para a tela /pendente fazer polling)
-// Retorna APENAS o essencial (sem dados sensíveis)
 app.get('/pedido-status/:id', async (req, res) => {
   try {
     const pedidoId = String(req.params.id || '').trim();
@@ -766,14 +792,14 @@ app.post('/criar-preferencia', async (req, res) => {
       total: Number(total),
     });
 
-    res.status(201).json({ id: preferenceResult.id, init_point: preferenceResult.init_point });
+    res.status(201).json({ id: preferenceResult.id, init_point: preferenceResult.init_point, pedidoId: novoPedidoId });
   } catch (error) {
     log('error', 'API/PREF/ERROR', 'Erro ao criar preferência e salvar pedido', { message: error?.message, stack: error?.stack });
     res.status(500).json({ error: 'Erro interno ao processar o pedido.' });
   }
 });
 
-// ROTA /calcular-frete
+// ✅ ROTA /calcular-frete (corrigida: ViaCEP robusto + fallback BrasilAPI)
 app.post('/calcular-frete', async (req, res) => {
   const { cepDestino, items } = req.body;
 
@@ -789,6 +815,10 @@ app.post('/calcular-frete', async (req, res) => {
 
   try {
     const cleanCepDestino = String(cepDestino).replace(/\D/g, '');
+    if (!/^\d{8}$/.test(cleanCepDestino)) {
+      return res.status(400).json({ error: 'CEP inválido. Informe 8 dígitos.' });
+    }
+
     const viaCepUrl = `https://viacep.com.br/ws/${cleanCepDestino}/json/`;
 
     let addressInfo;
@@ -797,17 +827,54 @@ app.post('/calcular-frete', async (req, res) => {
 
     while (attempts < maxAttempts) {
       try {
-        const viaCepResponse = await fetch(viaCepUrl);
-        addressInfo = await viaCepResponse.json();
-        if (addressInfo.erro) throw new Error('CEP de destino não encontrado.');
+        const data = await fetchJsonSafe(
+          viaCepUrl,
+          { method: 'GET', headers: { Accept: 'application/json' } },
+          { timeoutMs: 8000 }
+        );
+
+        if (data?.erro) throw new Error('CEP de destino não encontrado.');
+
+        addressInfo = data;
         break;
       } catch (error) {
-        attempts++;
-        if (attempts === maxAttempts) {
-          log('error', 'API/FRETE/VIACEP_FATAL', 'Falha ao consultar ViaCEP após tentativas', { attempts, message: error?.message });
-          throw new Error('Não foi possível conectar com o serviço de CEP no momento. Tente novamente mais tarde.');
+        // última tentativa => fallback BrasilAPI
+        if (attempts === maxAttempts - 1) {
+          try {
+            const brUrl = `https://brasilapi.com.br/api/cep/v1/${cleanCepDestino}`;
+            const br = await fetchJsonSafe(
+              brUrl,
+              { method: 'GET', headers: { Accept: 'application/json' } },
+              { timeoutMs: 8000 }
+            );
+
+            addressInfo = {
+              logradouro: br.street || '',
+              bairro: br.neighborhood || '',
+              localidade: br.city || '',
+              uf: br.state || '',
+            };
+
+            log('warn', 'API/FRETE/VIACEP_FALLBACK', 'ViaCEP falhou — usando BrasilAPI', {
+              message: error?.message,
+            });
+
+            break;
+          } catch (fallbackErr) {
+            log('error', 'API/FRETE/VIACEP_FATAL', 'ViaCEP e BrasilAPI falharam', {
+              attempts: attempts + 1,
+              viaCep: error?.message,
+              brasilApi: fallbackErr?.message,
+            });
+            throw new Error('Não foi possível conectar com o serviço de CEP no momento. Tente novamente mais tarde.');
+          }
         }
-        log('warn', 'API/FRETE/VIACEP_RETRY', 'Tentativa ViaCEP falhou. Tentando novamente...', { attempts });
+
+        attempts++;
+        log('warn', 'API/FRETE/VIACEP_RETRY', 'Tentativa ViaCEP falhou. Tentando novamente...', {
+          attempts,
+          message: error?.message,
+        });
         await new Promise((resolve) => setTimeout(resolve, 1000 * attempts));
       }
     }
@@ -833,28 +900,26 @@ app.post('/calcular-frete', async (req, res) => {
       },
     };
 
-    const meResponse = await fetch('https://www.melhorenvio.com.br/api/v2/me/shipment/calculate', {
-      method: 'POST',
-      headers: {
-        Accept: 'application/json',
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${MELHOR_ENVIO_TOKEN}`,
-        'User-Agent': 'Carlton (carltoncoletivo@audionoiseskatevisual.com)',
+    const responseData = await fetchJsonSafe(
+      'https://www.melhorenvio.com.br/api/v2/me/shipment/calculate',
+      {
+        method: 'POST',
+        headers: {
+          Accept: 'application/json',
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${MELHOR_ENVIO_TOKEN}`,
+          'User-Agent': 'Carlton (carltoncoletivo@audionoiseskatevisual.com)',
+        },
+        body: JSON.stringify(shipmentPayload),
       },
-      body: JSON.stringify(shipmentPayload),
-    });
+      { timeoutMs: 15000 }
+    );
 
-    const responseData = await meResponse.json();
-    if (!meResponse.ok) {
-      log('error', 'API/FRETE/ME_ERROR', 'Erro retornado pelo Melhor Envio', responseData);
-      throw new Error(responseData.message || 'Erro ao comunicar com a Melhor Envio.');
-    }
-
-    const formattedServices = responseData
+    const formattedServices = (Array.isArray(responseData) ? responseData : [])
       .filter((option) => {
-        if (option.error) return false;
-        const isSedex = option.company.name === 'Correios' && option.name === 'SEDEX';
-        const isLoggi = option.company.name === 'Loggi';
+        if (option?.error) return false;
+        const isSedex = option?.company?.name === 'Correios' && option?.name === 'SEDEX';
+        const isLoggi = option?.company?.name === 'Loggi';
         return isSedex || isLoggi;
       })
       .map((option) => ({
@@ -866,18 +931,18 @@ app.post('/calcular-frete', async (req, res) => {
 
     log('info', 'API/FRETE/OK', 'Fretes calculados', { cepDestino: cleanCepDestino, servicesCount: formattedServices.length });
 
-    res.status(200).json({
+    return res.status(200).json({
       services: formattedServices,
       addressInfo: {
-        logradouro: addressInfo.logradouro,
-        bairro: addressInfo.bairro,
-        localidade: addressInfo.localidade,
-        uf: addressInfo.uf,
+        logradouro: addressInfo?.logradouro || '',
+        bairro: addressInfo?.bairro || '',
+        localidade: addressInfo?.localidade || '',
+        uf: addressInfo?.uf || '',
       },
     });
   } catch (error) {
     log('error', 'API/FRETE/ERROR', 'Erro ao calcular frete', { message: error?.message });
-    res.status(500).json({ error: error.message || 'Não foi possível calcular o frete.' });
+    return res.status(500).json({ error: error.message || 'Não foi possível calcular o frete.' });
   }
 });
 
@@ -886,7 +951,6 @@ app.post('/notificacao-pagamento', async (req, res) => {
   const topic = req.query.topic || req.query.type;
   const paymentIdCandidate = req.query.id || req.query['data.id'];
 
-  // 1) Ignora o que não processa (200 para evitar retry)
   if (topic !== 'payment') {
     log('info', 'MP/WEBHOOK/IGNORED', 'Notificação ignorada (topic não suportado)', {
       topic,
@@ -896,7 +960,6 @@ app.post('/notificacao-pagamento', async (req, res) => {
     return res.status(200).send('Ignored');
   }
 
-  // 2) Valida assinatura só do que processa
   const sig = validateMpWebhook(req);
   if (!sig.ok) {
     log('error', 'MP/WEBHOOK/SIG_INVALID', 'Assinatura inválida (bloqueado)', {
@@ -1064,32 +1127,23 @@ app.get('/checar-pedidos-expirados', async (req, res) => {
 });
 
 // ------------------- PREVIEW DE EMAIL (DEV / TESTE) -------------------
-// ⚠️ Não envia email — apenas renderiza o HTML no navegador
 app.get('/preview-email', async (req, res) => {
   try {
     const type = String(req.query.type || 'confirm'); // confirm | tracking | expiry
     const pedidoId = Number(req.query.pedidoId);
     const trackingCode = String(req.query.tracking || 'BR123456789BR');
 
-    if (!pedidoId) {
-      return res.status(400).send('Informe ?pedidoId=NUMERO');
-    }
+    if (!pedidoId) return res.status(400).send('Informe ?pedidoId=NUMERO');
 
     const [rows] = await db.query('SELECT * FROM pedidos WHERE id = ?', [pedidoId]);
-    if (!rows.length) {
-      return res.status(404).send('Pedido não encontrado');
-    }
+    if (!rows.length) return res.status(404).send('Pedido não encontrado');
 
     const pedido = rows[0];
 
     let payload;
-    if (type === 'tracking') {
-      payload = buildEmail('tracking', pedido, { trackingCode });
-    } else if (type === 'expiry') {
-      payload = buildEmail('expiry', pedido);
-    } else {
-      payload = buildEmail('confirm', pedido);
-    }
+    if (type === 'tracking') payload = buildEmail('tracking', pedido, { trackingCode });
+    else if (type === 'expiry') payload = buildEmail('expiry', pedido);
+    else payload = buildEmail('confirm', pedido);
 
     res.setHeader('Content-Type', 'text/html; charset=utf-8');
     return res.status(200).send(payload.html);
@@ -1113,7 +1167,13 @@ async function enviarEmailDeConfirmacao(pedido) {
     html,
   });
 
-  if (result.ok) log('info', 'MAIL/CONFIRM/OK', 'E-mail de confirmação enviado', { pedidoId: pedido.id, provider: result.provider, id: result.id, fromUsed: result.fromUsed });
+  if (result.ok)
+    log('info', 'MAIL/CONFIRM/OK', 'E-mail de confirmação enviado', {
+      pedidoId: pedido.id,
+      provider: result.provider,
+      id: result.id,
+      fromUsed: result.fromUsed,
+    });
   else log('error', 'MAIL/CONFIRM/ERROR', 'Erro ao enviar e-mail de confirmação', { pedidoId: pedido.id, result });
 }
 
@@ -1127,7 +1187,13 @@ async function enviarEmailComRastreio(pedido, trackingCode) {
     html,
   });
 
-  if (result.ok) log('info', 'MAIL/TRACK/OK', 'E-mail de rastreio enviado', { pedidoId: pedido.id, provider: result.provider, id: result.id, fromUsed: result.fromUsed });
+  if (result.ok)
+    log('info', 'MAIL/TRACK/OK', 'E-mail de rastreio enviado', {
+      pedidoId: pedido.id,
+      provider: result.provider,
+      id: result.id,
+      fromUsed: result.fromUsed,
+    });
   else log('error', 'MAIL/TRACK/ERROR', 'Erro ao enviar e-mail de rastreio', { pedidoId: pedido.id, result });
 }
 
@@ -1141,7 +1207,13 @@ async function enviarEmailDeExpiracao(pedido) {
     html,
   });
 
-  if (result.ok) log('info', 'MAIL/EXPIRY/OK', 'E-mail de expiração enviado', { pedidoId: pedido.id, provider: result.provider, id: result.id, fromUsed: result.fromUsed });
+  if (result.ok)
+    log('info', 'MAIL/EXPIRY/OK', 'E-mail de expiração enviado', {
+      pedidoId: pedido.id,
+      provider: result.provider,
+      id: result.id,
+      fromUsed: result.fromUsed,
+    });
   else log('error', 'MAIL/EXPIRY/ERROR', 'Erro ao enviar e-mail de expiração', { pedidoId: pedido.id, result });
 }
 
@@ -1212,22 +1284,20 @@ async function inserirPedidoNoCarrinhoME(pedido) {
     },
   };
 
-  const response = await fetch('https://www.melhorenvio.com.br/api/v2/me/cart', {
-    method: 'POST',
-    headers: {
-      Accept: 'application/json',
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${MELHOR_ENVIO_TOKEN}`,
-      'User-Agent': 'Carlton (carltoncoletivo@audionoiseskatevisual.com)',
+  const data = await fetchJsonSafe(
+    'https://www.melhorenvio.com.br/api/v2/me/cart',
+    {
+      method: 'POST',
+      headers: {
+        Accept: 'application/json',
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${MELHOR_ENVIO_TOKEN}`,
+        'User-Agent': 'Carlton (carltoncoletivo@audionoiseskatevisual.com)',
+      },
+      body: JSON.stringify(payload),
     },
-    body: JSON.stringify(payload),
-  });
-
-  const data = await response.json();
-  if (!response.ok) {
-    log('error', 'ME/CART/ERROR', 'Erro ao inserir no carrinho do Melhor Envio', { status: response.status, response: data });
-    throw new Error(JSON.stringify(data.error || data.message || 'Erro ao inserir no carrinho Melhor Envio.'));
-  }
+    { timeoutMs: 20000 }
+  );
 
   const melhorEnvioId = data.id;
   if (melhorEnvioId) {
@@ -1313,10 +1383,10 @@ app.post('/rastrear-pedido', async (req, res) => {
     };
 
     log('info', 'API/RASTREIO/OK', 'Pedido encontrado e enviado ao frontend', { pedidoId: pedidoDoBanco.id, status: pedidoDoBanco.status });
-    res.status(200).json(dadosFormatadosParaFrontend);
+    return res.status(200).json(dadosFormatadosParaFrontend);
   } catch (error) {
     log('error', 'API/RASTREIO/ERROR', 'Erro ao buscar pedido pelo CPF', { message: error?.message, stack: error?.stack });
-    res.status(500).json({ error: 'Ocorreu um erro interno. Por favor, tente mais tarde.' });
+    return res.status(500).json({ error: 'Ocorreu um erro interno. Por favor, tente mais tarde.' });
   }
 });
 
